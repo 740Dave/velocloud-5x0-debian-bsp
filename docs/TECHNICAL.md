@@ -259,8 +259,20 @@ coretemp reading (the Atom C2000 has per-core sensors, no package sensor).
   drive demand: the duty stays `drive_min_duty` and drive-demand-on stays set.
   Later, drive demand releases as before. The hold only keeps drive demand
   up; it does not touch the CPU path, the fail-safes or the stall latch, and it
-  is not kept over a restart. `drive_min_run_s` is validated at start
-  (>= 0; 0 disables) and a negative value stops the service with a logged error.
+  is not kept over a restart. The hold ends early only when no drive reports a
+  temperature any more (all drives gone or failing; one read error on the only
+  drive ends it too); while another drive still reports, it continues. If the
+  drive warms into the 55 to 60 C band during the hold, drive-demand-on stays set
+  after the hold ends, as it would had the drive never fallen to 55 C. The hold
+  starts on every off-to-on change of drive demand, also while the CPU already
+  runs the fan. Each start and end is logged at info, and `state.json` carries
+  `drive_hold_active`, `drive_hold_until` (epoch seconds) and
+  `drive_hold_remaining_s`.
+  `drive_min_run_s` must be 0 to 3600 (0 disables). Any invalid `fan.conf` value
+  (this key included, fractions below 0 too) is a configuration error: the
+  service logs a CRIT line, writes the ALERT file, sets full duty (verified) and
+  exits 3. The unit lists 3 in `RestartPreventExitStatus`, so it ends failed
+  with the fan at full duty and is not restarted until the file is fixed.
   On a 520 the fan service is not enabled for now (the 520 has a fan, but its
   controller has not been identified or verified on hardware; contributions
   welcome), so this does nothing.

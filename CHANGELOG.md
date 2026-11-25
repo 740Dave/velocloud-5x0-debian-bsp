@@ -5,17 +5,22 @@
 Not yet run on hardware. Tested off the box only (fake sensors and a fake fan
 chip); the 30-minute check on a 540 is still to be done.
 
-- Fan: a minimum run time. Each time drive demand starts the fan, the fan holds
-  at least `drive_min_duty` (69/255) for `drive_min_run_s` seconds (new key in
+- Fan: a minimum run time. Each time drive demand turns on (also if the CPU
+  already runs the fan), the fan holds at least `drive_min_duty` (69/255) for `drive_min_run_s` seconds (new key in
   `/etc/velo5x0-bsp/fan.conf`, default 600) before drive demand may release it,
   even if the hottest drive falls to the off threshold (55 C) sooner. This
   answers the 0.5.0 observation of 30-second bursts. `drive_min_run_s = 0`
-  turns it off; a negative value is refused at start. CPU demand, the CPU
-  fail-safes (a fail-safe always wins) and the stall latch are unaffected; a
-  drive that vanishes or stops reporting clears the hold. The timer is not
-  kept over a daemon restart.
-- Upgrading with an edited `fan.conf`: add `drive_min_run_s` if you want a value
-  other than 600; a file without it uses 600.
+  turns it off. The value must be 0 to 3600; anything else (negative, fractional
+  negative, too large, not a number) is a configuration error: CRIT log line,
+  ALERT file, fan at verified full duty, exit 3, and no restart loop (3 is now in
+  the unit's `RestartPreventExitStatus`). CPU demand, the CPU fail-safes (a
+  fail-safe always wins) and the stall latch are unaffected. The hold ends early
+  only when no drive reports a temperature any more. The timer is not kept over
+  a daemon restart. Each hold start and end is logged, and `state.json` gains
+  `drive_hold_active`, `drive_hold_until` and `drive_hold_remaining_s`.
+- Upgrading with an edited `fan.conf`: dpkg asks about the conffile, because the
+  shipped file gained the key. Keeping your file is fine: a file without
+  `drive_min_run_s` uses 600, so every upgraded box gets the 10-minute hold.
 
 ## 0.5.0 (2026-11-24)
 

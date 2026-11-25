@@ -525,17 +525,14 @@ class TestMinimumRun(unittest.TestCase):
             self.assertEqual(c.duty, 69)
             raw.clock.sleep(30)
             s.set("hwmon1", 54.0)
-            while raw.clock() - t0 < 598:
+            while raw.clock() - t0 < 600:
                 cpu(c, st, seq, 40.0)
                 c.step()
                 self.assertEqual(c.duty, 69, raw.clock() - t0)
                 raw.clock.sleep(2)
-            while raw.clock() - t0 < 604:
-                cpu(c, st, seq, 40.0)
-                c.step()
-                if raw.clock() - t0 >= 600:
-                    self.assertEqual(c.duty, 0, raw.clock() - t0)
-                raw.clock.sleep(2)
+            self.assertEqual(raw.clock() - t0, 600)
+            cpu(c, st, seq, 40.0)
+            c.step()                            # exactly 600 s after the start: released
             self.assertEqual(c.duty, 0)
             self.assertFalse(c.drive_on)
 
@@ -632,15 +629,145 @@ class TestMinimumRun(unittest.TestCase):
             self.assertEqual(c.duty, 0)
             self.assertFalse(log.has("crit", ""))
 
+    def test_hold_logged_and_published(self):
+        with tempfile.TemporaryDirectory() as td:
+            sf = os.path.join(td, "state.json")
+            s = FakeSys(td)
+            s.add("hwmon1", "drivetemp", 61.0, block="sda")
+            c, raw, log, st, seq = make_drive(s, cfg=dict(fan.DEFAULTS), state_file=sf)
+            c.cfg["drive_min_run_s"] = 600
+            c.step()
+            d = json.loads(read(sf))
+            self.assertTrue(d["drive_hold_active"])
+            self.assertAlmostEqual(d["drive_hold_remaining_s"], 600, delta=1)
+            self.assertGreater(d["drive_hold_until"], time.time())
+            self.assertTrue(log.has("info", "minimum run holds duty 69 for 600 s"))
+            s.set("hwmon1", 54.0)
+            raw.clock.sleep(30)
+            c.step()
+            self.assertTrue(log.has("info", "54.0 C: minimum run holds duty 69"))
+            raw.clock.sleep(570)
+            c.step()
+            d = json.loads(read(sf))
+            self.assertFalse(d["drive_hold_active"])
+            self.assertIsNone(d["drive_hold_until"])
+            self.assertTrue(log.has("info", "minimum run ended"))
+
+    def test_hold_runs_from_the_start_not_from_last_hot_reading(self):
+        with tempfile.TemporaryDirectory() as td:
+            s, c, raw, log, st, seq = self.setup(td)
+            t0 = raw.clock()
+            for _ in range(150):                # 300 s at 61 C
+                c.step()
+                raw.clock.sleep(2)
+            s.set("hwmon1", 54.0)
+            c.step()
+            self.assertEqual(c.duty, 69)
+            while raw.clock() - t0 < 600:
+                raw.clock.sleep(2)
+            c.step()
+            self.assertEqual(c.duty, 0)
+
+    def test_arms_while_cpu_already_runs_the_fan(self):
+        with tempfile.TemporaryDirectory() as td:
+            s, c, raw, log, st, seq = self.setup(td, temp=50.0, cpu_t=70.0)
+            c.step()
+            self.assertGreater(c.duty, 69)
+            s.set("hwmon1", 61.0)
+            c.step()
+            s.set("hwmon1", 54.0)
+            cpu(c, st, seq, 45.0)
+            raw.clock.sleep(30)
+            c.step()
+            self.assertEqual(c.duty, 69)
+            raw.clock.sleep(600)
+            c.step()
+            self.assertEqual(c.duty, 0)
+
+    def test_hold_ends_only_when_no_drive_reports(self):
+        with tempfile.TemporaryDirectory() as td:
+            s, c, raw, log, st, seq = self.setup(td)
+            s.add("hwmon2", "drivetemp", 40.0, block="sdc")
+            c.step()
+            s.remove("hwmon1")                  # sda gone, sdc still reports 40 C
+            raw.clock.sleep(10)
+            c.step()
+            self.assertEqual(c.duty, 69)
+            s.remove("hwmon2")                  # none left
+            raw.clock.sleep(10)
+            c.step()
+            self.assertEqual(c.duty, 0)
+
+    def test_drive_warming_into_band_during_hold_keeps_on_after_expiry(self):
+        with tempfile.TemporaryDirectory() as td:
+            s, c, raw, log, st, seq = self.setup(td)
+            c.step()
+            s.set("hwmon1", 54.0)
+            raw.clock.sleep(10)
+            c.step()
+            s.set("hwmon1", 57.0)
+            raw.clock.sleep(10)
+            c.step()
+            raw.clock.sleep(1000)
+            c.step()
+            self.assertEqual(c.duty, 69)        # hysteresis: still above 55 C
+            s.set("hwmon1", 55.0)
+            c.step()
+            self.assertEqual(c.duty, 0)
+
+    def test_cpu_demand_continues_after_hold_ends(self):
+        with tempfile.TemporaryDirectory() as td:
+            s, c, raw, log, st, seq = self.setup(td, cpu_t=70.0)
+            c.step()
+            s.set("hwmon1", 54.0)
+            raw.clock.sleep(700)
+            c.step()
+            self.assertEqual(c.duty, fan.target_duty(70.0, fan.DEFAULTS))
+
     def test_validation(self):
-        for bad in (-1, -600):
+        for bad in (-1, -600, -0.5, 3601, float("nan"), float("inf")):
             cfg = dict(fan.DEFAULTS)
             cfg["drive_min_run_s"] = bad
-            with self.assertRaises(ValueError):
+            with self.assertRaises(fan.ConfigError):
                 fan.Controller(fan.GuardedBus(tf.FakeI2C(), tf.Logs()), lambda: 40.0, cfg, tf.Logs())
-        cfg = dict(fan.DEFAULTS)
-        cfg["drive_min_run_s"] = 0
-        fan.Controller(fan.GuardedBus(tf.FakeI2C(), tf.Logs()), lambda: 40.0, cfg, tf.Logs())
+        for good in (0, 1, 3600):
+            cfg = dict(fan.DEFAULTS)
+            cfg["drive_min_run_s"] = good
+            fan.Controller(fan.GuardedBus(tf.FakeI2C(), tf.Logs()), lambda: 40.0, cfg, tf.Logs())
+
+    def test_load_config_refuses_bad_values(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "fan.conf")
+            for bad in ("-1", "-0.5", "3601", "abc", "nan"):
+                tf.put(p, "[fan]\ndrive_min_run_s = %s\n" % bad)
+                with self.assertRaises(fan.ConfigError, msg=bad):
+                    fan.load_config(p)
+
+    def test_config_error_in_run_gives_exit_3_alert_and_full_duty(self):
+        self.assertEqual(fan.EXIT_CONFIG, 3)
+        unit = read(os.path.join(SRC, "systemd/system/velo5x0-fand.service"))
+        self.assertIn("RestartPreventExitStatus=2 3", unit)
+        with tempfile.TemporaryDirectory() as td:
+            alert = os.path.join(td, "ALERT")
+            conf = os.path.join(td, "fan.conf")
+            tf.put(conf, "[fan]\ndrive_min_run_s = -5\n")
+            log = tf.Logs()
+            calls = []
+            saved = (fan.open_bus, fan.identify, fan.load_config, fan.failsafe_full, fan.ALERT_FILE)
+            orig_load = fan.load_config
+            try:
+                fan.open_bus = lambda lg: object()
+                fan.identify = lambda *a, **k: True
+                fan.load_config = lambda: orig_load(conf)
+                fan.failsafe_full = lambda bus, lg, why, **k: calls.append(why) or True
+                fan.ALERT_FILE = alert
+                rc = fan.cmd_run(None, log)
+            finally:
+                fan.open_bus, fan.identify, fan.load_config, fan.failsafe_full, fan.ALERT_FILE = saved
+            self.assertEqual(rc, 3)
+            self.assertEqual(calls, ["configuration error"])      # full duty is set, exactly once
+            self.assertTrue(log.has("crit", "configuration error"))
+            self.assertIn("drive_min_run_s", read(alert))
 
     def test_load_config_reads_key(self):
         with tempfile.TemporaryDirectory() as td:

@@ -94,6 +94,12 @@ CONF_FILE = "/etc/velo5x0-bsp/fan.conf"
 EXIT_OK = 0
 EXIT_WRITE_FAILED = 1           # alert raised
 EXIT_PRECONDITION = 2           # no chip / wrong ID: nothing written
+EXIT_CONFIG = 3                 # bad fan.conf: full duty set, alert raised, no restart loop
+DRIVE_MIN_RUN_MAX_S = 3600      # sane ceiling for drive_min_run_s
+
+
+class ConfigError(ValueError):
+    """fan.conf (or a built-in default) is invalid: the service must not restart-loop."""
 IDENTIFY_TRIES_RUN = 5          # service start: ~10 s of retries before exit 2
 IDENTIFY_TRIES_FULL = 3         # fail-safe: short, it must not delay shutdown
 
@@ -224,6 +230,17 @@ class GuardedBus:
         if after != before:
             self.raw.write(PCA_FAN_ADDR, reg, after)
         return before, after
+
+
+def check_min_run(v):
+    """drive_min_run_s must be 0 (off) to DRIVE_MIN_RUN_MAX_S; fractional negatives included."""
+    try:
+        ok = 0 <= float(v) <= DRIVE_MIN_RUN_MAX_S
+    except (TypeError, ValueError):
+        ok = False
+    if not ok:
+        raise ConfigError("drive_min_run_s must be 0 to %d seconds (0 disables the minimum run time), got %r"
+                          % (DRIVE_MIN_RUN_MAX_S, v))
 
 
 def raise_alert(log, msg, alert_file):
@@ -594,6 +611,7 @@ class Controller:
         self.drive_fn = drive_fn            # () -> (source, {name: C|None}); None = no drive input
         self.drive_on = False               # drive-demand-on (hysteresis bit)
         self.drive_duty = 0
+        self.hold_logged = False
         self.drive_hold_until = None        # clock time before which drive demand may not release (min run)
         self.drive_temp = None              # hottest drive used as the input
         self.drive_name = None
@@ -623,8 +641,7 @@ class Controller:
             raise ValueError("stall_free_duty must be 1..255")
         if not (c["drive_off_c"] < c["drive_on_c"] <= c["drive_ramp_c"] < c["drive_full_c"]):
             raise ValueError("need drive_off_c < drive_on_c <= drive_ramp_c < drive_full_c")
-        if int(c["drive_min_run_s"]) < 0:
-            raise ValueError("drive_min_run_s must be >= 0 (0 disables the minimum run time)")
+        check_min_run(c["drive_min_run_s"])
         if int(c["drive_min_duty"]) <= int(c["stall_free_duty"]) or int(c["drive_min_duty"]) > DUTY_FULL:
             # a v0.4 config with a raised stall_free_duty stays valid: the drive
             # minimum moves up to just above it (VBSP-REQ-14: above stall-free)
@@ -795,13 +812,26 @@ class Controller:
         # clears it, 14A), and cannot block a CPU fail-safe or the stall latch,
         # which do not read this value.  The timer is not kept over a restart.
         run_s = int(self.cfg["drive_min_run_s"])
+        now_c = self.clock()
         if self.drive_on and not was_on and run_s > 0:
-            self.drive_hold_until = self.clock() + run_s
-        if self.drive_temp is None or run_s <= 0:
-            self.drive_hold_until = None
-        elif (not self.drive_on and was_on and self.drive_hold_until is not None
-              and self.clock() < self.drive_hold_until):
-            self.drive_duty, self.drive_on = int(self.cfg["drive_min_duty"]), True
+            self.drive_hold_until = now_c + run_s
+            self.log("info", "drive demand on: minimum run holds duty %d for %d s"
+                     % (int(self.cfg["drive_min_duty"]), run_s))
+        elif self.drive_hold_until is not None:
+            if self.drive_temp is None or run_s <= 0:
+                self.drive_hold_until = None
+                self.log("info", "minimum run ended: no drive reports a temperature")
+            elif now_c >= self.drive_hold_until:
+                self.drive_hold_until = None
+                self.log("info", "minimum run ended: drive demand follows the drive again")
+            elif not self.drive_on and was_on:
+                self.drive_duty, self.drive_on = int(self.cfg["drive_min_duty"]), True
+                if not self.hold_logged:
+                    self.hold_logged = True
+                    self.log("info", "drive at %.1f C: minimum run holds duty %d for %d s more"
+                             % (self.drive_temp, self.drive_duty, int(self.drive_hold_until - now_c)))
+        if self.drive_hold_until is None:
+            self.hold_logged = False
         if self.drive_on != was_on:
             self.log("info", "drive demand %s (hottest %s)" % (
                 "on at %.1f C: duty %d" % (self.drive_temp, self.drive_duty) if self.drive_on
@@ -884,6 +914,9 @@ class Controller:
             stopped, rpm = self.tach_stopped()
         except OSError:
             stopped, rpm = None, None
+        hold_left = None
+        if self.drive_hold_until is not None and self.clock() < self.drive_hold_until:
+            hold_left = round(self.drive_hold_until - self.clock(), 1)
         st = {"time": time.time(), "temp_c": t, "max_temp_c": self.max_temp, "state": self.state,
               "duty": self.duty, "rpm_approx": rpm, "tach_stopped": stopped,
               "sensor_error": self.sensor_error, "stall_latched": self.stall_latched,
@@ -892,6 +925,9 @@ class Controller:
               "drive_temp_c": self.drive_temp, "drive_name": self.drive_name,
               "drive_source": self.drive_source, "drive_demand_active": self.drive_duty > 0,
               "drive_demand_on": self.drive_on, "drive_duty": self.drive_duty,
+              "drive_hold_active": hold_left is not None,
+              "drive_hold_until": None if hold_left is None else time.time() + hold_left,
+              "drive_hold_remaining_s": hold_left,
               "drives": {n: {"reporting": r["reporting"], "temp_c": r["temp_c"]}
                          for n, r in sorted(self.drives.items())}}
         try:
@@ -927,11 +963,15 @@ def load_config(path=CONF_FILE):
     cfg = dict(DEFAULTS)
     cp = configparser.ConfigParser()
     if os.path.exists(path):
-        cp.read(path)
-        if cp.has_section("fan"):
-            for k in DEFAULTS:
-                if cp.has_option("fan", k):
-                    cfg[k] = float(cp.get("fan", k))
+        try:
+            cp.read(path)
+            if cp.has_section("fan"):
+                for k in DEFAULTS:
+                    if cp.has_option("fan", k):
+                        cfg[k] = float(cp.get("fan", k))
+        except (configparser.Error, ValueError) as e:
+            raise ConfigError("cannot read %s: %s" % (path, e))
+    check_min_run(cfg["drive_min_run_s"])
     for k in ("stall_free_duty", "kick_duty", "stall_polls", "stall_kicks") + DRIVE_INT_KEYS:
         cfg[k] = int(cfg[k])
     return cfg
@@ -982,7 +1022,13 @@ def cmd_run(args, log):
             c.step()
             sd_notify("WATCHDOG=1")
             c.sleep(float(cfg["poll_s"]))
-    except Exception as e:  # any failure after identification, config errors included
+    except ConfigError as e:
+        # a bad fan.conf: restarting cannot fix it.  Full duty, a CRIT line and the
+        # ALERT file; exit 3 is in RestartPreventExitStatus, so the unit ends failed.
+        raise_alert(log, "configuration error, service not started: %s" % (e,), ALERT_FILE)
+        failsafe_full(bus, log, "configuration error")
+        return EXIT_CONFIG
+    except Exception as e:  # any other failure after identification
         log("err", "control failure: %r" % (e,))
         failsafe_full(bus, log, "control failure")
         return EXIT_WRITE_FAILED

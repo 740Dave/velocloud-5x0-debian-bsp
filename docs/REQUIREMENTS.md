@@ -118,14 +118,16 @@ until T is at or below 55 C (or no drive reports a temperature). Drive demand is
 evaluated on every poll of the CPU loop. The thresholds and the 69 minimum are
 configurable in `/etc/velo5x0-bsp/fan.conf`.
 
-**REQ-14 amendment (0.5.1): minimum run time.** Whenever the fan starts because
-of drive demand, it MUST run at no less than the drive minimum duty (69 of 255)
+**REQ-14 amendment (0.5.1): minimum run time.** Whenever drive demand turns on
+(also if the CPU already runs the fan), the fan MUST run at no less than the drive minimum duty (69 of 255)
 for at least 10 minutes (`drive_min_run_s`, default 600) before drive demand may
 turn it off, even if the hottest drive falls to 55 C or below sooner. In plain
 terms: once a hot drive starts the fan, it keeps running for at least 10
 minutes. CPU demand, the CPU fail-safes and the stall latch are unaffected, and a
 CPU fail-safe always wins. A value of 0 disables the minimum; a negative value
-is refused. The timer need not survive a restart of the service. Test: a drive
+(or above 3600) is a configuration error: the service logs it, raises the alert,
+sets full duty and does not restart-loop (exit 3). The hold ends early only when
+no drive reports a temperature any more. The timer need not survive a restart of the service. Test: a drive
 at 61 C then 54 C after 30 s gives duty 69 until 600 s and then 0
 (`tests/test_fan_drive.py`, `TestMinimumRun`).
 
