@@ -1,7 +1,8 @@
 #!/usr/bin/python3
 # SPDX-License-Identifier: GPL-2.0
 """velo5x0-fan: temperature-driven control of the EMC2104 fan on a VeloCloud
-Edge 540 (velo5x0-bsp, VBSP-REQ-10 / VBSP-DES-5).
+Edge 540 (velo5x0-bsp, VBSP-REQ-10 / VBSP-DES-5; drive input VBSP-REQ-14 /
+VBSP-DES-9).
 
 Written for this package from the register recipe recorded in the spec
 (VBSP-HW-FAN) and the EMC2104 datasheet; no upstream script text is used.
@@ -23,6 +24,9 @@ Rules kept here (VBSP-REQ-7, VBSP-REQ-10):
     configuration register bits 6 and 7 are changed; polarity is never
     written;
   * the fan is either off (duty 0) or at or above the stall-free duty;
+  * the duty written is max(CPU demand, drive demand); a drive that reports
+    no temperature, a drive read failure or a vanished drive never triggers
+    the fail-safe (VBSP-REQ-14A); only the CPU sensor does;
   * on stop, crash, kill, hang (watchdog) or sensor error the duty is set to
     0xff; a full write that cannot be verified, or a fan that stays stalled,
     raises the alert (ALERT_FILE, a CRIT journal line and a non-zero exit).
@@ -43,10 +47,13 @@ import fcntl
 import glob
 import json
 import os
+import shutil
+import subprocess
 import signal
 import socket
 import sys
 import syslog
+import threading
 import time
 
 # ---------------------------------------------------------------- constants
@@ -101,7 +108,20 @@ DEFAULTS = {
     "poll_s": 2.0,
     "stall_polls": 3,       # consecutive stopped-tach polls while running = stall
     "stall_kicks": 3,       # kicks without recovery before the stall alert
+    # drive input (VBSP-REQ-14)
+    "drive_off_c": 55.0,    # hottest drive at or below: no drive demand, drive-demand-on cleared
+    "drive_on_c": 60.0,     # at or above: drive-demand-on set, duty drive_min_duty
+    "drive_ramp_c": 65.0,   # from here the duty rises linearly ...
+    "drive_full_c": 70.0,   # ... to full duty at this temperature and above
+    "drive_min_duty": 69,   # 69/255 = 27 %; must exceed stall_free_duty (VBSP-REQ-14B)
 }
+DRIVE_INT_KEYS = ("drive_min_duty",)
+SMARTCTL_INTERVAL_S = 60.0      # smartctl fallback: at most one pass a minute
+SMARTCTL_CMD_TIMEOUT_S = 3.0    # per command
+SMARTCTL_PASS_BUDGET_S = 8.0    # per pass, all commands together (watchdog is 30 s)
+DRIVE_READ_INTERVAL_S = 10.0    # the reader thread reads the drives this often
+DRIVE_STALE_S = 30.0            # a snapshot older than this means a hung read: hold the last demand while the drive is present
+DRIVE_FIRST_WAIT_S = 2.0        # at most this long for the first snapshot at start
 
 
 class I2CError(OSError):
@@ -322,6 +342,196 @@ def read_coretemp(sysfs="/sys"):
     return max(temps) if temps else None
 
 
+# ------------------------------------------------------------ drive temperature
+def _drive_name(hwmon_dir):
+    """Block device name behind a drivetemp hwmon (sda), else the hwmon name."""
+    for b in sorted(glob.glob(os.path.join(hwmon_dir, "device/block/*"))):
+        return os.path.basename(b)
+    return os.path.basename(hwmon_dir)
+
+
+def read_drivetemp(sysfs="/sys"):
+    """Every drive the kernel drivetemp driver exposes: {name: C or None}.  None =
+    the sensor exists but could not be read.  A drive that reports no temperature
+    (the onboard flash) has no drivetemp hwmon and is simply absent here.  The
+    glob is repeated on every call, so a drive added later is found (VBSP-REQ-14E)."""
+    out = {}
+    for h in sorted(glob.glob(os.path.join(sysfs, "class/hwmon/hwmon*"))):
+        try:
+            if _read(os.path.join(h, "name")).strip() != "drivetemp":
+                continue
+        except OSError:
+            continue
+        name = _drive_name(h)
+        try:
+            out[name] = int(_read(os.path.join(h, "temp1_input")).strip()) / 1000.0
+        except (OSError, ValueError):
+            out[name] = None
+    return out
+
+
+def _present_drivetemp(sysfs="/sys"):
+    """Names of the drivetemp hwmon devices that exist now: sysfs directory and
+    name reads only, never the temperature (which can hang on a bad drive)."""
+    names = set()
+    for h in glob.glob(os.path.join(sysfs, "class/hwmon/hwmon*")):
+        try:
+            if _read(os.path.join(h, "name")).strip() == "drivetemp":
+                names.add(_drive_name(h))
+        except OSError:
+            continue
+    return names
+
+
+def _run_smartctl(args, timeout):
+    """Run smartctl with a hard bound on our wait.  On a timeout the child is
+    killed and never waited for without a limit (a process stuck in
+    uninterruptible sleep on a failing disk cannot be reaped); the caller sees
+    subprocess.TimeoutExpired."""
+    p = subprocess.Popen(["smartctl"] + args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                         text=True)
+    try:
+        out, _ = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            p.kill()
+        except OSError:
+            pass
+        try:
+            p.communicate(timeout=1.0)      # reap if it dies; otherwise leave it, bounded
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            pass
+        raise
+    return out
+
+
+class DriveSource:
+    """Drive temperatures: drivetemp hwmon first; smartctl only when drivetemp
+    exposes no drive at all and smartctl is installed (bounded, at most once a
+    minute, last result reused in between).  poll() -> (source, {name: C|None})."""
+
+    def __init__(self, sysfs="/sys", which=shutil.which, run=_run_smartctl, clock=time.monotonic):
+        self.sysfs, self.which, self.run, self.clock = sysfs, which, run, clock
+        self._next_smart = None
+        self._smart = {}
+
+    def poll(self):
+        d = read_drivetemp(self.sysfs)
+        if d:
+            return "drivetemp", d
+        if not self.which("smartctl"):
+            return None, {}
+        now = self.clock()
+        if self._next_smart is None or now >= self._next_smart:
+            self._next_smart = now + SMARTCTL_INTERVAL_S
+            self._smart = self._smartctl_pass(now)
+        return ("smartctl", dict(self._smart)) if self._smart else (None, {})
+
+    def present(self):
+        """Drives that still exist, without touching them (see DriveReader)."""
+        d = _present_drivetemp(self.sysfs)
+        if d:
+            return d
+        return {n for n in self._smart if os.path.exists("/dev/" + n)}
+
+    def _smartctl_pass(self, start):
+        res = {}
+        try:
+            devs = json.loads(self.run(["--scan", "-j"], SMARTCTL_CMD_TIMEOUT_S)).get("devices", [])
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return res
+        for dev in devs:
+            if self.clock() - start > SMARTCTL_PASS_BUDGET_S:
+                break
+            path = dev.get("name", "")
+            if not path.startswith("/dev/"):
+                continue
+            args = ["-A", "-j", "-n", "standby"]
+            if dev.get("type"):
+                args += ["-d", dev["type"]]
+            try:
+                j = json.loads(self.run(args + [path], SMARTCTL_CMD_TIMEOUT_S))
+            except subprocess.TimeoutExpired:
+                res[os.path.basename(path)] = None      # present, did not answer
+                continue
+            except (OSError, ValueError, subprocess.SubprocessError):
+                continue
+            cur = (j.get("temperature") or {}).get("current")
+            if isinstance(cur, (int, float)) and not isinstance(cur, bool):
+                res[os.path.basename(path)] = float(cur)
+            # no temperature (flash, standby): not an input, not an error
+        return res
+
+
+class DriveReader:
+    """Reads the drives on its own daemon thread so that a slow or hung drive
+    can never delay the control loop (VBSP-REQ-14A).  poll() returns the last
+    good snapshot (source, {name: C|None}) without any I/O.
+    The thread reads every interval_s and does one read at a time.
+    A snapshot older than stale_s means a read has HANGED, not that the drive
+    went away: the last readings are then held, for the drives that still exist
+    (checked without reading them), until a fresh reading arrives or the device
+    disappears, so a hot drive keeps its cooling demand.  Only a read that
+    returns an error or a device that is gone drops a drive."""
+
+    def __init__(self, source, interval_s=DRIVE_READ_INTERVAL_S, stale_s=DRIVE_STALE_S,
+                 clock=time.monotonic, log=None):
+        self.source, self.interval_s, self.stale_s, self.clock = source, interval_s, stale_s, clock
+        self.log = log
+        self._stale_logged = False
+        self._lock = threading.Lock()
+        self._snap = None                   # (source, readings, taken_at)
+        self._stop = threading.Event()
+        self._first = threading.Event()
+        self._thread = None
+
+    def refresh(self):
+        """One read, publishing the result; a failing source publishes nothing drive-like."""
+        try:
+            src, readings = self.source.poll()
+        except Exception:
+            src, readings = None, {}
+        with self._lock:
+            self._snap = (src, dict(readings), self.clock())
+        self._first.set()
+
+    def _run(self):
+        while not self._stop.is_set():
+            self.refresh()
+            self._stop.wait(self.interval_s)
+
+    def start(self, first_wait_s=DRIVE_FIRST_WAIT_S):
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._run, name="velo5x0-drives", daemon=True)
+            self._thread.start()
+            self._first.wait(first_wait_s)      # bounded; a hung first read just means no drive yet
+        return self
+
+    def stop(self):
+        self._stop.set()
+
+    def poll(self):
+        with self._lock:
+            snap = self._snap
+        if snap is None:
+            return None, {}
+        if self.clock() - snap[2] <= self.stale_s:
+            self._stale_logged = False
+            return snap[0], dict(snap[1])
+        # a hung read: hold the last readings of the drives that are still there
+        try:
+            present = self.source.present() if hasattr(self.source, "present") else None
+        except Exception:
+            present = None
+        held = {n: v for n, v in snap[1].items() if present is None or n in present}
+        if held and not self._stale_logged:
+            self._stale_logged = True
+            if self.log is not None:
+                self.log("warning", "drive temperature read hung (no reading for %.0f s): holding the last "
+                         "drive demand until a reading arrives or the drive is removed" % (self.clock() - snap[2]))
+        return snap[0], held
+
+
 # ----------------------------------------------------------- systemd notify
 def sd_notify(msg, env=os.environ):
     """sd_notify(3) without libsystemd: one datagram to $NOTIFY_SOCKET."""
@@ -351,14 +561,43 @@ def target_duty(t, cfg):
     return max(sf, min(DUTY_FULL, int(round(d))))
 
 
+def drive_demand(t, on, cfg):
+    """Drive demand for the hottest reporting drive t (None = no drive) and the
+    drive-demand-on state bit: returns (duty, on).  VBSP-REQ-14: at or below
+    drive_off_c none and cleared; from drive_on_c the minimum duty and set;
+    between off and on the minimum duty only while set (hysteresis); from
+    drive_ramp_c linear to full at drive_full_c."""
+    if t is None or t <= cfg["drive_off_c"]:
+        return 0, False
+    if t >= cfg["drive_on_c"]:
+        on = True
+    if not on:
+        return 0, False
+    mn = int(cfg["drive_min_duty"])
+    if t >= cfg["drive_full_c"]:
+        return DUTY_FULL, True
+    if t <= cfg["drive_ramp_c"]:
+        return mn, True
+    d = mn + (DUTY_FULL - mn) * (t - cfg["drive_ramp_c"]) / (cfg["drive_full_c"] - cfg["drive_ramp_c"])
+    return max(mn, min(DUTY_FULL, int(d + 0.5))), True
+
+
 class Controller:
     OFF, RUN = "off", "run"
 
     def __init__(self, bus, temp_fn, cfg, log, sleep=time.sleep, clock=time.monotonic,
-                 state_file=None, alert_file=None):
+                 state_file=None, alert_file=None, drive_fn=None):
         self.bus, self.temp_fn, self.cfg, self.log = bus, temp_fn, cfg, log
         self.sleep, self.clock = sleep, clock
         self.state_file, self.alert_file = state_file, alert_file
+        self.drive_fn = drive_fn            # () -> (source, {name: C|None}); None = no drive input
+        self.drive_on = False               # drive-demand-on (hysteresis bit)
+        self.drive_duty = 0
+        self.drive_temp = None              # hottest drive used as the input
+        self.drive_name = None
+        self.drive_source = None
+        self.drives = {}                    # every drive that reported once: {name: {"reporting", "temp_c"}}
+        self.drive_input = None             # True/False once evaluated: drives the "no drive" log line
         self.state = None
         self.duty = None
         self.written_at = None
@@ -380,6 +619,15 @@ class Controller:
             raise ValueError("need off_c < on_c < full_c")
         if not (1 <= int(c["stall_free_duty"]) <= DUTY_FULL):
             raise ValueError("stall_free_duty must be 1..255")
+        if not (c["drive_off_c"] < c["drive_on_c"] <= c["drive_ramp_c"] < c["drive_full_c"]):
+            raise ValueError("need drive_off_c < drive_on_c <= drive_ramp_c < drive_full_c")
+        if int(c["drive_min_duty"]) <= int(c["stall_free_duty"]) or int(c["drive_min_duty"]) > DUTY_FULL:
+            # a v0.4 config with a raised stall_free_duty stays valid: the drive
+            # minimum moves up to just above it (VBSP-REQ-14: above stall-free)
+            fixed = min(DUTY_FULL, int(c["stall_free_duty"]) + 1)
+            self.log("warning", "drive_min_duty %d is not above stall_free_duty %d (or above 255): using %d"
+                     % (int(c["drive_min_duty"]), int(c["stall_free_duty"]), fixed))
+            c["drive_min_duty"] = fixed
 
     def identify(self):
         self.identified = identify(self.bus, self.log)
@@ -490,6 +738,59 @@ class Controller:
         self.set_duty(d)
         self.kicks_without_recovery += 1
 
+    # -- drive input (VBSP-REQ-14, 14A, 14E; VBSP-DES-9)
+    def drive_step(self):
+        """Evaluate the drive input once per poll; returns the drive demand duty.
+        Never raises into the control loop and never triggers the fail-safe: a
+        failed read or a vanished drive only drops that drive and logs once."""
+        if self.drive_fn is None:
+            return 0
+        try:
+            source, now = self.drive_fn()
+        except Exception as e:      # a broken source is "no drive", not a fan fault
+            self.log("warning", "drive temperature source failed: %r" % (e,))
+            source, now = None, {}
+        for name, v in sorted(now.items()):
+            rec = self.drives.get(name)
+            if v is None:
+                if rec is None:
+                    self.drives[name] = {"reporting": False, "temp_c": None}
+                    self.log("info", "drive %s: no temperature yet (never reported)" % name)
+                elif rec["reporting"]:
+                    self.log("info" if rec.get("source") == "smartctl" else "warning",
+                             "drive %s: temperature read failed; dropped from the drive input" % name)
+                    rec["reporting"], rec["temp_c"] = False, None
+                continue
+            if rec is None or not rec["reporting"]:
+                self.log("info", "drive %s: temperature input present (%.1f C, %s)" % (name, v, source))
+            self.drives[name] = {"reporting": True, "temp_c": v, "source": source}
+        for name, rec in self.drives.items():
+            if name not in now and rec["reporting"]:
+                # a drive the smartctl fallback no longer sees may only be in standby
+                self.log("info" if rec.get("source") == "smartctl" else "warning",
+                         "drive %s: gone; dropped from the drive input" % name)
+                rec["reporting"], rec["temp_c"] = False, None
+        live = {n: r["temp_c"] for n, r in self.drives.items() if r["reporting"]}
+        had = self.drive_input
+        self.drive_input = bool(live)
+        if had is None or had != self.drive_input:
+            if not live:
+                self.log("info", "no drive temperature input")
+        if live:
+            self.drive_name = max(sorted(live), key=lambda n: live[n])
+            self.drive_temp = live[self.drive_name]
+            self.drive_source = source
+        else:
+            self.drive_name = self.drive_temp = self.drive_source = None
+        was_on = self.drive_on
+        self.drive_duty, self.drive_on = drive_demand(self.drive_temp, self.drive_on, self.cfg)
+        if self.drive_on != was_on:
+            self.log("info", "drive demand %s (hottest %s)" % (
+                "on at %.1f C: duty %d" % (self.drive_temp, self.drive_duty) if self.drive_on
+                else "off", "none" if self.drive_name is None else "%s %s" % (
+                    self.drive_name, "n/a" if self.drive_temp is None else "%.1f C" % self.drive_temp)))
+        return self.drive_duty
+
     # -- one control step
     def step(self):
         t = self.temp_fn()
@@ -500,7 +801,10 @@ class Controller:
             if self.duty != DUTY_FULL:
                 self.full("sensor read error")
             self.state = self.RUN
+            self.drive_step()               # after the fail-safe write; keeps the published drive fields current
+            self.write_state(None)
             return t
+        dd = self.drive_step()
         if self.sensor_error:
             self.log("info", "CPU temperature readable again (%.1f C)" % t)
             self.sensor_error = False
@@ -517,30 +821,41 @@ class Controller:
             return t
         if self.state is not None and self.duty is not None:
             self.check_duty()
+        cpu_kick, force, msg = False, False, None
         if self.state is None:
             self.state = self.OFF if t <= c["off_c"] else self.RUN
             if self.state == self.OFF:
-                self.set_duty(0)
-                self.log("info", "%.1f C <= %.0f C: fan off" % (t, c["off_c"]))
+                force = True
+                msg = "%.1f C <= %.0f C: fan off" % (t, c["off_c"])
+        on_msg = None
         if self.state == self.OFF:
             if t >= c["on_c"]:
-                self.kick()
+                cpu_kick = True
                 self.state = self.RUN
                 self.stopped_polls = 0
-                self.set_duty(target_duty(t, c))
-                self.log("info", "%.1f C >= %.0f C: fan on, duty %d" % (t, c["on_c"], self.duty))
-            elif self.duty != 0:
-                self.set_duty(0)
+                on_msg = "%.1f C >= %.0f C: fan on, duty %%d" % (t, c["on_c"])
+            steady_run = False
         else:
+            steady_run = True
             if t <= c["off_c"]:
-                self.set_duty(0)
+                force = True
+                steady_run = False
                 self.state = self.OFF
-                self.log("info", "%.1f C <= %.0f C: fan off" % (t, c["off_c"]))
-            else:
-                d = target_duty(t, c)
-                if d != self.duty:
-                    self.set_duty(d)
-                self.check_stall(d)
+                msg = "%.1f C <= %.0f C: fan off" % (t, c["off_c"])
+        cpu_d = 0 if self.state == self.OFF else target_duty(t, c)
+        want = max(cpu_d, dd)
+        if msg and want > 0:
+            msg = "%.1f C <= %.0f C: CPU demand off; drive demand holds duty %d" % (t, c["off_c"], want)
+        if cpu_kick or (dd > 0 and self.duty == 0):
+            self.kick()                     # spin up from stopped, as before
+        if cpu_kick or force or want != self.duty:
+            self.set_duty(want)
+        if on_msg:
+            self.log("info", on_msg % self.duty)
+        if msg:
+            self.log("info", msg)
+        if want > 0 and not cpu_kick and (steady_run or dd > 0):
+            self.check_stall(want)
         self.write_state(t)
         return t
 
@@ -554,7 +869,13 @@ class Controller:
         st = {"time": time.time(), "temp_c": t, "max_temp_c": self.max_temp, "state": self.state,
               "duty": self.duty, "rpm_approx": rpm, "tach_stopped": stopped,
               "sensor_error": self.sensor_error, "stall_latched": self.stall_latched,
-              "full_failed": self.full_failed}
+              "full_failed": self.full_failed,
+              # drive input (VBSP-REQ-14C)
+              "drive_temp_c": self.drive_temp, "drive_name": self.drive_name,
+              "drive_source": self.drive_source, "drive_demand_active": self.drive_duty > 0,
+              "drive_demand_on": self.drive_on, "drive_duty": self.drive_duty,
+              "drives": {n: {"reporting": r["reporting"], "temp_c": r["temp_c"]}
+                         for n, r in sorted(self.drives.items())}}
         try:
             os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
             tmp = self.state_file + ".tmp"
@@ -593,7 +914,7 @@ def load_config(path=CONF_FILE):
             for k in DEFAULTS:
                 if cp.has_option("fan", k):
                     cfg[k] = float(cp.get("fan", k))
-    for k in ("stall_free_duty", "kick_duty", "stall_polls", "stall_kicks"):
+    for k in ("stall_free_duty", "kick_duty", "stall_polls", "stall_kicks") + DRIVE_INT_KEYS:
         cfg[k] = int(cfg[k])
     return cfg
 
@@ -621,7 +942,9 @@ def cmd_run(args, log):
     c = None
     try:
         cfg = load_config()
-        c = Controller(bus, read_coretemp, cfg, log, state_file=STATE_FILE, alert_file=ALERT_FILE)
+        reader = DriveReader(DriveSource(), log=log)
+        c = Controller(bus, read_coretemp, cfg, log, state_file=STATE_FILE, alert_file=ALERT_FILE,
+                       drive_fn=reader.poll)
         c.identified = True
         stop = {"flag": False}
 
@@ -629,9 +952,12 @@ def cmd_run(args, log):
             stop["flag"] = True
         signal.signal(signal.SIGTERM, on_term)
         signal.signal(signal.SIGINT, on_term)
-        log("info", "start: off %.0f C, on %.0f C, full %.0f C, stall-free duty %d"
-            % (cfg["off_c"], cfg["on_c"], cfg["full_c"], cfg["stall_free_duty"]))
+        log("info", "start: off %.0f C, on %.0f C, full %.0f C, stall-free duty %d; drives off %.0f, on %.0f, "
+            "ramp %.0f, full %.0f C, min duty %d"
+            % (cfg["off_c"], cfg["on_c"], cfg["full_c"], cfg["stall_free_duty"], cfg["drive_off_c"],
+               cfg["drive_on_c"], cfg["drive_ramp_c"], cfg["drive_full_c"], cfg["drive_min_duty"]))
         c.configure()
+        reader.start()
         sd_notify("READY=1")
         while not stop["flag"]:
             c.step()
@@ -647,7 +973,8 @@ def cmd_run(args, log):
 
 def cmd_probe(args, log):
     dev = find_adapter()
-    out = {"adapter": dev, "coretemp_c": read_coretemp()}
+    src, drives = DriveSource().poll()
+    out = {"adapter": dev, "coretemp_c": read_coretemp(), "drive_source": src, "drives_c": drives}
     if dev:
         bus = GuardedBus(LinuxI2C(dev), log)
 

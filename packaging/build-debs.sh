@@ -31,6 +31,7 @@ sed -i "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"$VER\"/" \
 	"$P/usr/src/vc-edge5x0-dsa-$VER/dkms.conf"
 cp "$SRC/PROVENANCE.md" "$SRC/README.md" "$SRC/docs/TECHNICAL.md" "$SRC/docs/REQUIREMENTS.md" "$P/usr/share/doc/velo5x0-bsp-dkms/"
 cp "$SRC/LICENSE" "$P/usr/share/doc/velo5x0-bsp-dkms/copyright"
+cp "$SRC/LICENSE" "$P/usr/share/doc/velo5x0-bsp-dkms/copyright"
 cat >"$P/DEBIAN/control" <<EOF
 Package: velo5x0-bsp-dkms
 Version: $DEBVER
@@ -103,6 +104,7 @@ inst 0644 "$P/usr/lib/systemd/network/10-velo5x0-ge1.link" "$SRC/systemd/network
 inst 0644 "$P/usr/lib/systemd/network/10-velo5x0-ge2.link" "$SRC/systemd/network/10-velo5x0-ge2.link"
 inst 0644 "$P/usr/lib/modprobe.d/velo5x0-bsp.conf" "$SRC/modprobe.d/velo5x0-bsp.conf"
 inst 0644 "$P/usr/lib/modules-load.d/velo5x0-bsp.conf" "$SRC/modules-load.d/velo5x0-bsp.conf"
+inst 0644 "$P/usr/share/velo5x0-bsp/drivetemp-modules-load.conf" "$SRC/modules-load.d/velo5x0-drivetemp.conf"
 inst 0755 "$P/usr/share/initramfs-tools/hooks/velo5x0-bsp" "$SRC/initramfs-tools/hooks/velo5x0-bsp"
 inst 0755 "$P/usr/lib/velo5x0-bsp/velo5x0-kernel-guard" "$SRC/kernel/velo5x0-kernel-guard"
 inst 0755 "$P/etc/kernel/postinst.d/dkms-velo5x0-guard" "$SRC/kernel/postinst.d/dkms-velo5x0-guard"
@@ -112,9 +114,11 @@ inst 0755 "$P/etc/kernel/postrm.d/zz-velo5x0-pin" "$SRC/kernel/postrm.d/zz-velo5
 inst 0644 "$P/usr/share/velo5x0-bsp/grub-default.cfg" "$SRC/grub/velo5x0-bsp.cfg"
 inst 0755 "$P/usr/sbin/velo5x0-evidence" "$SRC/tools/velo5x0-evidence"
 inst 0644 "$P/usr/share/doc/velo5x0-bsp/README.md" "$SRC/README.md"
+inst 0644 "$P/usr/share/doc/velo5x0-bsp/CHANGELOG.md" "$SRC/CHANGELOG.md"
 inst 0644 "$P/usr/share/doc/velo5x0-bsp/PROVENANCE.md" "$SRC/PROVENANCE.md"
 inst 0644 "$P/usr/share/doc/velo5x0-bsp/TECHNICAL.md" "$SRC/docs/TECHNICAL.md"
 inst 0644 "$P/usr/share/doc/velo5x0-bsp/REQUIREMENTS.md" "$SRC/docs/REQUIREMENTS.md"
+inst 0644 "$P/usr/share/doc/velo5x0-bsp/copyright" "$SRC/LICENSE"
 inst 0644 "$P/usr/share/doc/velo5x0-bsp/copyright" "$SRC/LICENSE"
 printf '%s\n' /etc/velo5x0-bsp/fan.conf \
 	/etc/kernel/postinst.d/dkms-velo5x0-guard /etc/kernel/postinst.d/zz-velo5x0-pin \
@@ -125,11 +129,13 @@ Version: $DEBVER
 Architecture: all
 Maintainer: velo5x0-bsp maintainers <noreply@example.invalid>
 Depends: velo5x0-bsp-dkms (= $DEBVER), python3, systemd (>= 254), initramfs-tools, kmod, grub2-common
+Suggests: smartmontools
 Section: kernel
 Priority: optional
 Description: VeloCloud Edge 5x0 board support for Debian 13
  GE1/GE2 naming, load ordering, the switch bring-up, the Edge 540 fan
- service with its fail-safes, and a guard that stops a kernel update whose
+ service with its fail-safes and drive-temperature input (drivetemp,
+ smartctl only as a fallback), and a guard that stops a kernel update whose
  board modules did not build.
 EOF
 cat >"$P/DEBIAN/postinst" <<'EOF'
@@ -139,6 +145,16 @@ case "$1" in
 configure)
 	depmod -a "$(uname -r)" || true
 	systemctl daemon-reload || true
+	# the drive-temperature driver: loaded now and at every boot, but only on a
+	# kernel that has it (an unknown module in modules-load.d would leave
+	# systemd-modules-load failed); a kernel without it only loses the drive input
+	if modinfo drivetemp >/dev/null 2>&1; then
+		install -m 0644 /usr/share/velo5x0-bsp/drivetemp-modules-load.conf /etc/modules-load.d/velo5x0-drivetemp.conf
+		modprobe drivetemp 2>/dev/null || echo "velo5x0-bsp: drivetemp not loadable; no drive temperature input" >&2
+	else
+		rm -f /etc/modules-load.d/velo5x0-drivetemp.conf
+		echo "velo5x0-bsp: this kernel has no drivetemp module; no drive temperature input" >&2
+	fi
 	# enabled, not started: the services only run on an EDGE540
 	# (ConditionFirmware) and take effect from the next boot
 	systemctl enable velo5x0-fan-failsafe.service velo5x0-fand.service || true
@@ -162,6 +178,7 @@ set -e
 case "$1" in
 remove)
 	systemctl disable --now velo5x0-fand.service velo5x0-fan-failsafe.service || true
+	rm -f /etc/modules-load.d/velo5x0-drivetemp.conf
 	# give GRUB its own default back: no GRUB_DEFAULT=saved, no saved_entry
 	rm -f /etc/default/grub.d/velo5x0-bsp.cfg
 	grub-editenv - unset saved_entry || true

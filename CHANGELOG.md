@@ -1,18 +1,55 @@
 # velo5x0-bsp changelog
 
-## 0.4.1 (2026-11-24)
+## 0.5.0 (2026-11-24) - not yet run on hardware
 
-First public release. 0.4.0 was not published; this is 0.4.0 (which ran on one
-VeloCloud Edge 540 with the DSA kernel `6.12.118+velo5x0dsa1`) plus:
+Off-box tests and a review only; the drive input has not yet run on a unit as
+packaged. The tagged 0.4.1 is what runs on hardware today.
 
-- `velo5x0-check`: the DSA CPU-link check is judged by the port 4 status bit 11
-  while the conduit is up, and reported NOT RUN otherwise.
-- `tests/onbox/dsa-onbox-test.sh`: on-box DSA port tests (network and bridge
-  phases only; no I2C, no fan).
-- Public repository layout: `LICENSE`, `docs/REQUIREMENTS.md` (what the
-  `VBSP-...` ids in the code mean), `docs/TECHNICAL.md`, CI workflow.
+Spec v0.5 (VBSP-REQ-14, 14A to 14E, VBSP-DES-9).
 
-Contents: patched igb and board/switch/DSA modules by DKMS, `ge1`/`ge2` names,
-load-order and initramfs plumbing, the Edge 540 fan service with its
-fail-safes (CPU temperature only), the kernel-update guard, and the DSA kernel
-build script.
+- Fan: the duty written is max(CPU demand, drive demand). Drive demand from the
+  hottest drive that reports a temperature: at or below 55 C none; from 60 C
+  duty 69/255 (27 %); 65 C to 70 C linear 69 to 255; 70 C and above full. Once
+  on, it stays at least 69 until the hottest drive is at or below 55 C.
+  Thresholds are `drive_*` keys in `/etc/velo5x0-bsp/fan.conf` (defaults as
+  above; `drive_min_duty` must exceed `stall_free_duty`).
+- Drive temperatures come from the kernel `drivetemp` hwmon driver; the package
+  ships a module-load entry (installed to `/etc/modules-load.d/` by postinst) and loads it in postinst.
+  `smartctl` is used only when drivetemp exposes no drive and smartmontools is
+  installed (bounded timeouts, at most once a minute). Sensors are rediscovered
+  every poll, so a drive added later is used with no restart.
+- No temperature-reporting drive: the fan behaves as in 0.4.0, with one info
+  line "no drive temperature input". A drive read failure or a drive that
+  disappears drops that drive, is logged once, and is not a fail-safe trigger.
+  CPU sensor error and every other fail-safe are unchanged.
+- State file `/run/velo5x0-fan/state.json` gains `drive_temp_c`, `drive_name`,
+  `drive_source`, `drive_demand_active`, `drive_demand_on`, `drive_duty`, `drives`.
+  `velo5x0-fan probe` shows `drive_source` and `drives_c`.
+- Suggests smartmontools.
+- Drive reads run on a separate thread (every 10 s), so a slow or hung drive
+  never delays the control loop. A drive whose read hangs (no fresh reading for
+  30 s, device still present) keeps its last drive demand until a fresh reading
+  arrives or the device disappears (logged once); only an error return or the
+  device disappearing drops its demand. smartctl is run with a hard bound on
+  our wait and the child is killed on timeout. The drive input is evaluated after the CPU sensor-error branch,
+  so the full-duty fail-safe write never waits on it.
+- A drive that vanishes from the smartctl fallback (for example in standby) is
+  logged at info level, not as a warning.
+- A `drive_min_duty` not above `stall_free_duty` is raised to just above it with
+  a warning, instead of refusing a valid 0.4 configuration.
+- `drivetemp` is loaded at boot only on a kernel that has it (the package
+  installs `/etc/modules-load.d/velo5x0-drivetemp.conf` in postinst after
+  `modinfo drivetemp` succeeds).
+- Log lines: "CPU demand off; drive demand holds duty N" when the CPU drops
+  to off while a drive holds the fan; a drive that never reported is logged at
+  info level; drive fields stay published in the state file during a CPU
+  sensor error.
+
+## 0.4.1
+
+First public release (the former 0.4.0 plus a `velo5x0-check` DSA CPU-link
+fix and `tests/onbox/`). See the 0.4.1 tag.
+
+## 0.4.0
+
+0.4.0 was not published; 0.4.1 is the first public release.

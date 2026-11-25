@@ -235,8 +235,32 @@ coretemp reading (the Atom C2000 has per-core sensors, no package sensor).
 - Nothing is written unless the chip at 0x2f returns product ID 0x1d.
 - Alert (the channel is not decided yet): a CRIT journal line, the file
   `/run/velo5x0-fan/ALERT`, and a failed unit.
+- Drive temperature input (v0.5.0, VBSP-REQ-14): the duty written is the
+  greater of the CPU demand and the drive demand. Hottest reporting drive at or
+  below `drive_off_c` (55 C): no drive demand; from `drive_on_c` (60 C): duty
+  `drive_min_duty` (69 of 255, 27 %); 65 C to 70 C linear up to full; 70 C and
+  above full. Once on it stays at least 69 until the drive is at or below 55 C.
+  The temperatures come from the kernel `drivetemp` driver (loaded at boot by
+  `/etc/modules-load.d/velo5x0-drivetemp.conf`, installed by the package only
+  on a kernel that has the module); `smartctl` is the fallback only when
+  drivetemp exposes no drive (at most once a minute, so a drive found only by
+  the fallback shows up within about a minute, not within one poll). Drives are
+  read on a separate thread every 10 s, which never delays the CPU control
+  loop; a drive whose read hangs for 30 s keeps its last drive demand until a
+  fresh reading arrives or the device disappears. Drives are
+  rediscovered every poll. A drive that reports no temperature (the onboard
+  flash) is ignored; with no reporting drive the fan acts exactly as before and
+  logs "no drive temperature input" once. A drive read failure or a vanished
+  drive is logged and dropped, and never forces full duty. The state file
+  carries `drive_temp_c`, `drive_name`, `drive_demand_active` and `drives`.
+  On a 520 (no fan) the fan service is not enabled, so this does nothing.
 - `sudo velo5x0-fan probe` is a read-only dump; the service's state is the
   file `/run/velo5x0-fan/state.json`.
+- Upgrading from 0.4 with an edited `/etc/velo5x0-bsp/fan.conf`: the shipped
+  file gained the `drive_*` keys, so dpkg asks about the conffile. Keep your
+  file (`--force-confold` for unattended upgrades); the daemon fills in the
+  missing keys, and a `stall_free_duty` above 68 simply raises the drive
+  minimum to just above it (a warning is logged).
 
 ## igb and the external MDIO bus
 

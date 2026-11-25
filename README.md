@@ -10,9 +10,10 @@ The Debian packages are called `velo5x0-bsp` and `velo5x0-bsp-dkms`.
 - **LAN1 to LAN8** (two Marvell 88E6176 switches): on a stock Debian kernel they
   run as two plain 4-port switches. On a Debian kernel rebuilt with DSA (the
   script is in `kernel-build/`) each jack is its own interface, `lan1` to `lan8`.
-- **Fan** (Edge 540 only): a service that keeps the fan off unless the CPU needs it,
-  with full-speed fail-safes (service stop, crash, sensor error, early boot,
-  shutdown). A drive-temperature input is planned for 0.5.0 (not in this release).
+- **Fan** (Edge 540 only): a service that keeps the fan off unless the CPU or a
+  SATA/mSATA drive needs it, with full-speed fail-safes (service stop, crash,
+  sensor error, early boot, shutdown). From 0.5.0 it also takes a drive
+  temperature input.
 - **Kernel guard**: a kernel update whose board modules did not build never
   becomes the GRUB default, so a box managed over GE1 is not lost.
 
@@ -28,6 +29,10 @@ Running on one VeloCloud Edge 540 since 2026-11-24 on Debian 13 with kernel
 `6.12.118+velo5x0dsa1` (velo5x0-bsp 0.4.x). We'll update this section if we hit problems.
 
 Burn-in time is short so far; treat this as early. Reports from other units are welcome.
+
+**Version 0.5.0 is not yet run on hardware.** Its drive-temperature fan input has passed the
+off-box tests and a review, but the unit above runs 0.4.x. This section will say so until 0.5.0 has been
+deployed and has run for a while.
 
 ## Supported hardware
 
@@ -101,6 +106,16 @@ sudo dpkg -i linux-headers-<release>_*.deb linux-image-<release>_*.deb
 
 Never install the `linux-libc-dev` package it also produces. Details, switching
 between DSA and unmanaged modes, and upgrade notes are in `docs/TECHNICAL.md`.
+
+## Drive temperature and disk spin-down
+
+From 0.5.0 the fan service reads drive temperatures through the kernel
+`drivetemp` driver every 10 s. On some spinning disks, reading the temperature
+can keep the drive from spinning down (see the kernel's `drivetemp`
+documentation); SSDs and mSATA cards are not affected. To opt out, remove
+`/etc/modules-load.d/velo5x0-drivetemp.conf` and unload `drivetemp`; the fan then
+uses the CPU temperature only (or the `smartctl` fallback, which does not wake a
+sleeping drive).
 
 ## Safety warnings
 
