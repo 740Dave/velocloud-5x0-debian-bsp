@@ -1,0 +1,5 @@
+# velo5x0-leakscan allow list: <relative path>:<kind>:<value>, each reviewed.
+# Pristine Linux kernel igb source (byte-identical to Debian 6.12.118-1): author
+# attribution and a standard section number, not site inventory.
+dkms/igb-vc/drivers/net/ethernet/intel/igb/igb_ptp.c:email:richardcochran@gmail.com
+dkms/igb-vc/drivers/net/ethernet/intel/igb/igb_main.c:ipv4:7.2.7.7

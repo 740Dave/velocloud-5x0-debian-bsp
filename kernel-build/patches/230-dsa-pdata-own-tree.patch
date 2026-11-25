@@ -1,0 +1,44 @@
+velo5x0-bsp provenance (VBSP-REQ-8): lifted unchanged from
+  https://github.com/gallops-gannets/velo540openwrt
+  patches/230-dsa-pdata-own-tree.patch
+  commit d487e0734e7ad1da70d77ffefb681d0f4e90d317
+  licence: GPL-2.0 (a change to the Linux kernel, net/dsa/dsa.c, which is GPL-2.0)
+  upstream sha256 a686e23da944ce89954bb8f222aefc1f22646fab0b04125e9e8a53c84b9c7940
+Applied by velo5x0-kernel-build to Debian's linux-source-6.12 (6.12.118-1:
+applies without fuzz).  Everything above the From: line is this header.
+
+From: VeloCloud Edge 5x0 OpenWrt port
+Subject: [PATCH] net: dsa: give each platform-data switch its own tree
+
+dsa_switch_parse() hard-codes tree 0 for switches described by platform
+data, so a board with two independent switches (each with its own CPU
+port and conduit) cannot register the second one: it lands in the same
+tree with the same index and fails.
+
+Pick the lowest free tree index instead.  Device-tree switches are not
+affected; platform data still cannot describe interconnected switches.
+
+--- a/net/dsa/dsa.c
++++ b/net/dsa/dsa.c
+@@ -1462,15 +1462,19 @@ static int dsa_switch_parse_ports(struct
+ 
+ static int dsa_switch_parse(struct dsa_switch *ds, struct dsa_chip_data *cd)
+ {
++	int index = 0;
+ 	int err;
+ 
+ 	ds->cd = cd;
+ 
+-	/* We don't support interconnected switches nor multiple trees via
+-	 * platform data, so this is the unique switch of the tree.
++	/* We don't support interconnected switches via platform data, so
++	 * this is the unique switch of its tree; use the lowest free tree
++	 * index so that several independent switches can coexist.
+ 	 */
+ 	ds->index = 0;
+-	ds->dst = dsa_tree_touch(0);
++	while (dsa_tree_find(index))
++		index++;
++	ds->dst = dsa_tree_touch(index);
+ 	if (!ds->dst)
+ 		return -ENOMEM;

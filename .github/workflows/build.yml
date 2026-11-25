@@ -1,0 +1,71 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      - name: Install tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates python3 python3-pytest dpkg-dev patch gcc libc6-dev
+      - uses: actions/checkout@v4
+      - name: Python tests
+        run: python3 -B -m pytest -q tests
+      - name: Shell syntax
+        run: |
+          for f in packaging/build-debs.sh kernel-build/velo5x0-kernel-build kernel-build/velo5x0-kernel-build-docker \
+                   tools/velo5x0-evidence tests/onbox/dsa-onbox-test.sh; do sh -n "$f" || bash -n "$f"; done
+      - name: Build the .debs
+        run: sh packaging/build-debs.sh ./build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debs
+          path: build/*.deb
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test-and-build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: debs
+          path: debs
+      - name: Release notes from CHANGELOG.md
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          VER="${TAG#v}"
+          # the section "## <version> ..." up to the next "## " heading
+          awk -v h="## $VER" '
+            /^## / { on = (index($0, h) == 1 && (length($0) == length(h) || substr($0, length(h) + 1, 1) == " ")) }
+            on' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then echo "no CHANGELOG.md section for $VER" >&2; exit 1; fi
+          printf '\nNo kernel binaries are published: build the DSA kernel with kernel-build/ as described in the README.\n' >> notes.md
+          # a version whose section says it has not run on hardware is a pre-release
+          if grep -qi "not yet run on hardware" notes.md; then echo "--prerelease" > flags; else echo "--latest" > flags; fi
+          cat flags
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" debs/*.deb --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$TAG" --notes-file notes.md $(cat flags) --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" debs/*.deb --title "$TAG" --notes-file notes.md $(cat flags) --repo "$GITHUB_REPOSITORY"
+          fi

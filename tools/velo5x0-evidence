@@ -1,0 +1,23 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# velo5x0-evidence NAME COMMAND...: run COMMAND (as one shell command line) and
+# keep its command line, output and exit code, with the boot id, kernel and
+# times, in $VELO5X0_EVIDENCE (default /var/lib/velo5x0-bsp/evidence), so a
+# reviewer can check a test result after the fact and across reboots.
+set -u
+D=${VELO5X0_EVIDENCE:-/var/lib/velo5x0-bsp/evidence}
+[ $# -ge 2 ] || { echo "usage: velo5x0-evidence NAME COMMAND..." >&2; exit 2; }
+name=$1; shift
+mkdir -p "$D"
+f="$D/$(date +%Y%m%dT%H%M%S)-$name.txt"
+{
+	echo "# velo5x0-bsp evidence: $name"
+	echo "# boot_id $(cat /proc/sys/kernel/random/boot_id) kernel $(uname -r) uptime_s $(cut -d' ' -f1 /proc/uptime)"
+	echo "# started $(date -Is)"
+	echo "# command: $*"
+} >"$f"
+sh -c "$*" >>"$f" 2>&1
+rc=$?
+echo "# exit $rc at $(date -Is)" >>"$f"
+echo "$f"
+exit $rc

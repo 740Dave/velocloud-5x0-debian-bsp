@@ -1,0 +1,8 @@
+# velo5x0-bsp (VBSP-REQ-2): GE2 is I354 function 3, matched by PCI path,
+# never by MAC address, so the name holds on every unit.
+[Match]
+Path=pci-0000:00:14.3
+
+[Link]
+Name=ge2
+AlternativeNamesPolicy=database onboard slot path

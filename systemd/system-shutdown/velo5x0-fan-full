@@ -1,0 +1,6 @@
+#!/bin/sh
+# velo5x0-bsp (VBSP-DES-5 x-failsafe-b): last write of full fan duty at the
+# very end of shutdown, halt or reboot.  systemd-shutdown runs this with the
+# action as $1; the journal is gone by now, so the tool logs to /dev/kmsg.
+[ -x /usr/sbin/velo5x0-fan ] || exit 0
+exec /usr/sbin/velo5x0-fan --kmsg full --why "final-${1:-shutdown}"

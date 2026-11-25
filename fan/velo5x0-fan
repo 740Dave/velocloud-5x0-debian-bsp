@@ -1,0 +1,713 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0
+"""velo5x0-fan: temperature-driven control of the EMC2104 fan on a VeloCloud
+Edge 540 (velo5x0-bsp, VBSP-REQ-10 / VBSP-DES-5).
+
+Written for this package from the register recipe recorded in the spec
+(VBSP-HW-FAN) and the EMC2104 datasheet; no upstream script text is used.
+
+Subcommands
+  run      the control loop (systemd velo5x0-fand.service, Type=notify with
+           a watchdog)
+  full     the fail-safe: identify the chip, write full duty (0xff), verify it
+           by read-back after the spin-up time, set the 0x1c fan pins; reads
+           no configuration file (early boot, shutdown, ExecStopPost)
+  probe    read-only dump of the chip, the 0x1c expander and the sensors
+  sweep    calibration of the stall-free duty (VBSP-OPEN-11)
+
+Rules kept here (VBSP-REQ-7, VBSP-REQ-10):
+  * nothing is written unless register 0xfd at 0x2f reads 0x1d;
+  * the PCA9557 at 0x18 is never addressed;
+  * every write to the PCA9557 at 0x1c is a read-modify-write that carries
+    bits 0 and 1 (PoE) through exactly as read, and only output and
+    configuration register bits 6 and 7 are changed; polarity is never
+    written;
+  * the fan is either off (duty 0) or at or above the stall-free duty;
+  * on stop, crash, kill, hang (watchdog) or sensor error the duty is set to
+    0xff; a full write that cannot be verified, or a fan that stays stalled,
+    raises the alert (ALERT_FILE, a CRIT journal line and a non-zero exit).
+
+Reading register 0x40: the datasheet (rev 1.78, section 6.20) says it "always
+displays the current setting of the Fan 1 Driver", and a change from 00h
+starts the Spin Up Routine (section 5.7; section 6.25, register 0x46): 100 %
+for a quarter of the spin-up time, then the spin level (60 %, 0x99, by
+default) for the rest.  So after 0xff is written to a stopped fan, 0x40 reads
+0x99 for up to the spin-up time (500 ms by default) and then 0xff.  Every
+read-back check here waits that long before it calls a mismatch.
+"""
+
+import argparse
+import configparser
+import ctypes
+import fcntl
+import glob
+import json
+import os
+import signal
+import socket
+import sys
+import syslog
+import time
+
+# ---------------------------------------------------------------- constants
+EMC_ADDR = 0x2F
+EMC_PRODUCT_ID_REG = 0xFD
+EMC_PRODUCT_ID = 0x1D
+EMC_FAN_SETTING = 0x40          # duty, 0..255
+EMC_PWM_DIVIDE = 0x41
+EMC_FAN_CONFIG1 = 0x42
+EMC_SPINUP_CFG = 0x46           # SPINUP_TIME in bits 1:0 (datasheet table 6.40)
+EMC_PWM_BASE = 0x2B
+EMC_LUT_CONFIG = 0x50
+EMC_TACH_HI = 0x4E
+EMC_TACH_LO = 0x4F
+EMC_TEMP_REGS = (0x00, 0x02, 0x04, 0x06)   # internal, external 1..3 (information only)
+DUTY_FULL = 0xFF
+SPINUP_TIMES_S = (0.25, 0.5, 1.0, 2.0)     # SPINUP_TIME 00..11
+VERIFY_MARGIN_S = 0.5
+FULL_WRITE_TRIES = 3
+
+# open-loop PWM recipe (VBSP-HW-FAN x-recipe), applied in this order
+EMC_RECIPE = ((EMC_LUT_CONFIG, 0x00), (EMC_FAN_CONFIG1, 0x10),
+              (EMC_PWM_BASE, 0x0C), (EMC_PWM_DIVIDE, 0x01))
+
+PCA_RESETS_ADDR = 0x18          # never addressed by this tool
+PCA_FAN_ADDR = 0x1C
+PCA_IN, PCA_OUT, PCA_POL, PCA_CFG = 0, 1, 2, 3
+PCA_POE_BITS = 0x03             # bits 0 and 1: PoE shutdown / reset (VBSP-REQ-7B)
+PCA_FAN_BITS = 0xC0             # bit 6 FORCE_PWM (low), bit 7 FORCE_12V (high)
+PCA_FAN_OUT = 0x80
+
+ADAPTER_NAME = "vc-edge5x0 board i2c"
+STATE_DIR = "/run/velo5x0-fan"
+ALERT_FILE = STATE_DIR + "/ALERT"
+STATE_FILE = STATE_DIR + "/state.json"
+CONF_FILE = "/etc/velo5x0-bsp/fan.conf"
+
+EXIT_OK = 0
+EXIT_WRITE_FAILED = 1           # alert raised
+EXIT_PRECONDITION = 2           # no chip / wrong ID: nothing written
+IDENTIFY_TRIES_RUN = 5          # service start: ~10 s of retries before exit 2
+IDENTIFY_TRIES_FULL = 3         # fail-safe: short, it must not delay shutdown
+
+# Proposed defaults (VBSP-REQ-10); tunable in CONF_FILE.
+DEFAULTS = {
+    "off_c": 50.0,          # at or below: fan off (duty 0)
+    "on_c": 60.0,           # at or above (from off): fan starts
+    "full_c": 80.0,         # at or above: duty 0xff
+    "stall_free_duty": 24,  # measured: stock 540 fan turns at 12, stops at 8 (VBSP-OPEN-11)
+    "kick_duty": 255,       # spin-up from stopped
+    "kick_s": 2.0,
+    "poll_s": 2.0,
+    "stall_polls": 3,       # consecutive stopped-tach polls while running = stall
+    "stall_kicks": 3,       # kicks without recovery before the stall alert
+}
+
+
+class I2CError(OSError):
+    pass
+
+
+def _read(path):
+    with open(path) as f:
+        return f.read()
+
+
+# ------------------------------------------------------------------ backends
+class _SmbusData(ctypes.Union):
+    _fields_ = [("byte", ctypes.c_uint8), ("word", ctypes.c_uint16),
+                ("block", ctypes.c_uint8 * 34)]
+
+
+class _SmbusIoctl(ctypes.Structure):      # struct i2c_smbus_ioctl_data
+    _fields_ = [("read_write", ctypes.c_uint8), ("command", ctypes.c_uint8),
+                ("size", ctypes.c_uint32), ("data", ctypes.POINTER(_SmbusData))]
+
+
+class LinuxI2C:
+    """SMBus byte-data access through /dev/i2c-N (needs i2c-dev)."""
+
+    I2C_SLAVE = 0x0703
+    I2C_SMBUS = 0x0720
+    READ, WRITE = 1, 0
+    BYTE_DATA = 2
+
+    def __init__(self, devpath):
+        self.fd = os.open(devpath, os.O_RDWR)
+        self.addr = None
+
+    def _select(self, addr):
+        if self.addr != addr:
+            fcntl.ioctl(self.fd, self.I2C_SLAVE, addr)
+            self.addr = addr
+
+    def _xfer(self, addr, rw, reg, val=0):
+        self._select(addr)
+        data = _SmbusData()
+        data.byte = val & 0xFF
+        args = _SmbusIoctl(rw, reg, self.BYTE_DATA, ctypes.pointer(data))
+        try:
+            fcntl.ioctl(self.fd, self.I2C_SMBUS, args)
+        except OSError as e:
+            raise I2CError(e.errno, "i2c 0x%02x reg 0x%02x: %s" % (addr, reg, e.strerror))
+        return data.byte
+
+    def read(self, addr, reg):
+        return self._xfer(addr, self.READ, reg)
+
+    def write(self, addr, reg, val):
+        self._xfer(addr, self.WRITE, reg, val)
+
+
+def find_adapter(sysfs="/sys"):
+    p = os.path.join(sysfs, "module/vc_edge5x0_board/parameters/i2c_adapter")
+    try:
+        name = _read(p).strip()
+        if name.startswith("i2c-"):
+            return "/dev/" + name
+    except OSError:
+        pass
+    for d in sorted(glob.glob(os.path.join(sysfs, "bus/i2c/devices/i2c-*"))):
+        try:
+            if _read(os.path.join(d, "name")).strip() == ADAPTER_NAME:
+                return "/dev/" + os.path.basename(d)
+        except OSError:
+            continue
+    return None
+
+
+class GuardedBus:
+    """Every access goes through here; it enforces the hardware rules."""
+
+    def __init__(self, raw, log):
+        self.raw = raw
+        self.log = log
+
+    def read(self, addr, reg):
+        if addr == PCA_RESETS_ADDR:
+            raise PermissionError("0x18 is never addressed by the fan tool")
+        return self.raw.read(addr, reg)
+
+    def write_emc(self, reg, val):
+        self.raw.write(EMC_ADDR, reg, val)
+
+    def pca1c_rmw(self, reg, set_bits, clear_bits):
+        """Read-modify-write of output or configuration at 0x1c touching only bits 6/7."""
+        if reg not in (PCA_OUT, PCA_CFG):
+            raise PermissionError("0x1c register %d may not be written" % reg)
+        if (set_bits | clear_bits) & ~PCA_FAN_BITS:
+            raise PermissionError("only bits 6 and 7 of 0x1c may change")
+        before = self.raw.read(PCA_FAN_ADDR, reg)
+        after = (before & ~clear_bits) | set_bits
+        assert (after & PCA_POE_BITS) == (before & PCA_POE_BITS)
+        if after != before:
+            self.raw.write(PCA_FAN_ADDR, reg, after)
+        return before, after
+
+
+def raise_alert(log, msg, alert_file):
+    log("crit", "ALERT: " + msg)
+    if alert_file:
+        try:
+            os.makedirs(os.path.dirname(alert_file), exist_ok=True)
+            with open(alert_file, "a") as f:
+                f.write("%s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), msg))
+        except OSError:
+            pass
+
+
+# ------------------------------------------------------------ the fail-safe
+def identify(bus, log, tries=1, sleep=time.sleep, gap_s=1.0):
+    """Product-ID precondition.  A NACK is retried up to `tries` times (a
+    transient bus error at start must not be final); a wrong ID is final."""
+    for n in range(1, tries + 1):
+        try:
+            pid = bus.read(EMC_ADDR, EMC_PRODUCT_ID_REG)
+            break
+        except OSError as e:
+            if n == tries:
+                log("err", "EMC2104 at 0x2f does not answer after %d tries (%s); writing nothing" % (tries, e))
+                return False
+            log("warning", "EMC2104 at 0x2f did not answer (%s); retry %d/%d" % (e, n, tries - 1))
+            sleep(gap_s)
+    if pid != EMC_PRODUCT_ID:
+        log("err", "device at 0x2f has product ID 0x%02x, not 0x1d; writing nothing" % pid)
+        return False
+    return True
+
+
+def spinup_time(bus):
+    """Spin-up time programmed in register 0x46 (seconds); the longest on error."""
+    try:
+        return SPINUP_TIMES_S[bus.read(EMC_ADDR, EMC_SPINUP_CFG) & 0x03]
+    except OSError:
+        return SPINUP_TIMES_S[-1]
+
+
+def wait_for_duty(bus, want, sleep, clock, spin_s, margin_s=VERIFY_MARGIN_S, step_s=0.05):
+    """Wait out the spin-up time, then poll 0x40 until it reads `want` or the
+    margin passes; returns the last value.  Reading earlier proves nothing: the
+    first quarter of a spin-up reads 0xff (the 100 % kick) and then drops to the
+    spin level (measured on a 540: 0xff at 5 ms, 0x99 from ~126 ms, 0xff from ~497 ms)."""
+    sleep(spin_s)
+    end = clock() + margin_s
+    val = bus.read(EMC_ADDR, EMC_FAN_SETTING)
+    while val != want and clock() < end:
+        sleep(step_s)
+        val = bus.read(EMC_ADDR, EMC_FAN_SETTING)
+    return val
+
+
+def failsafe_full(bus, log, why, alert_file=ALERT_FILE, sleep=time.sleep, clock=time.monotonic,
+                  alert=True):
+    """The fail-safe, independent of any configuration: write 0xff, verify it by
+    read-back after the spin-up time (retrying the write), then put the 0x1c fan
+    pins in the state where the fan follows the drive (bit 6 low, bit 7 high).
+    The caller has identified the chip.  Returns True only if 0xff was verified."""
+    try:
+        before = "0x%02x" % bus.read(EMC_ADDR, EMC_FAN_SETTING)
+    except OSError:
+        before = "unreadable"
+    spin_s = spinup_time(bus)
+    wait_s = spin_s + VERIFY_MARGIN_S
+    ok, last, err = False, None, None
+    for attempt in range(1, FULL_WRITE_TRIES + 1):
+        try:
+            bus.write_emc(EMC_FAN_SETTING, DUTY_FULL)
+            last = wait_for_duty(bus, DUTY_FULL, sleep, clock, spin_s)
+            if last == DUTY_FULL:
+                ok = True
+                break
+            log("err", "full duty written but 0x40 reads 0x%02x after %.2f s (attempt %d)"
+                % (last, wait_s, attempt))
+        except OSError as e:
+            err = e
+            log("err", "full duty write attempt %d failed: %s" % (attempt, e))
+    pins = "not set"
+    try:
+        o = bus.pca1c_rmw(PCA_OUT, PCA_FAN_OUT, PCA_FAN_BITS & ~PCA_FAN_OUT)
+        c = bus.pca1c_rmw(PCA_CFG, 0, PCA_FAN_BITS)
+        pins = "OUT 0x%02x->0x%02x CFG 0x%02x->0x%02x" % (o[0], o[1], c[0], c[1])
+    except (OSError, PermissionError, AssertionError) as e:
+        raise_alert(log, "0x1c fan pins not set (%s): %s" % (why, e), alert_file)
+    if ok:
+        log("warning", "fan set to full duty 0xff, verified (%s); duty before: %s; 0x1c %s"
+            % (why, before, pins))
+        return True
+    msg = ("full duty NOT verified after %d attempts (%s); last read %s%s"
+           % (FULL_WRITE_TRIES, why, "none" if last is None else "0x%02x" % last,
+              "" if err is None else "; error %s" % err))
+    if alert:
+        raise_alert(log, msg, alert_file)
+    else:
+        log("err", msg + " (alert already raised; retrying every poll)")
+    return False
+
+
+# --------------------------------------------------------------- temperature
+def read_coretemp(sysfs="/sys"):
+    """Hottest coretemp reading in C (package if present, else max core); None on error."""
+    temps = []
+    for h in glob.glob(os.path.join(sysfs, "class/hwmon/hwmon*")):
+        try:
+            if _read(os.path.join(h, "name")).strip() != "coretemp":
+                continue
+        except OSError:
+            continue
+        for f in glob.glob(os.path.join(h, "temp*_input")):
+            try:
+                temps.append(int(_read(f).strip()) / 1000.0)
+            except (OSError, ValueError):
+                return None
+    return max(temps) if temps else None
+
+
+# ----------------------------------------------------------- systemd notify
+def sd_notify(msg, env=os.environ):
+    """sd_notify(3) without libsystemd: one datagram to $NOTIFY_SOCKET."""
+    addr = env.get("NOTIFY_SOCKET")
+    if not addr:
+        return False
+    if addr.startswith("@"):
+        addr = "\0" + addr[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.connect(addr)
+            s.sendall(msg.encode())
+        return True
+    except OSError:
+        return False
+
+
+# --------------------------------------------------------------- the policy
+def target_duty(t, cfg):
+    """Running duty for temperature t (only used in the RUN state)."""
+    sf, on_c, full_c = int(cfg["stall_free_duty"]), cfg["on_c"], cfg["full_c"]
+    if t >= full_c:
+        return DUTY_FULL
+    if t <= on_c:
+        return sf
+    d = sf + (DUTY_FULL - sf) * (t - on_c) / (full_c - on_c)
+    return max(sf, min(DUTY_FULL, int(round(d))))
+
+
+class Controller:
+    OFF, RUN = "off", "run"
+
+    def __init__(self, bus, temp_fn, cfg, log, sleep=time.sleep, clock=time.monotonic,
+                 state_file=None, alert_file=None):
+        self.bus, self.temp_fn, self.cfg, self.log = bus, temp_fn, cfg, log
+        self.sleep, self.clock = sleep, clock
+        self.state_file, self.alert_file = state_file, alert_file
+        self.state = None
+        self.duty = None
+        self.written_at = None
+        self.mismatch_since = None
+        self.stopped_polls = 0
+        self.kicks_without_recovery = 0
+        self.stall_alerted = False
+        self.stall_latched = False
+        self.full_failed = False
+        self.sensor_error = False
+        self.identified = False
+        self.max_temp = None
+        self.spin_s = SPINUP_TIMES_S[-1]
+        self._validate()
+
+    def _validate(self):
+        c = self.cfg
+        if not (c["off_c"] < c["on_c"] < c["full_c"]):
+            raise ValueError("need off_c < on_c < full_c")
+        if not (1 <= int(c["stall_free_duty"]) <= DUTY_FULL):
+            raise ValueError("stall_free_duty must be 1..255")
+
+    def identify(self):
+        self.identified = identify(self.bus, self.log)
+        return self.identified
+
+    def alert(self, msg):
+        raise_alert(self.log, msg, self.alert_file)
+
+    # -- writes
+    def set_duty(self, d):
+        if d != 0 and d != DUTY_FULL and d < int(self.cfg["stall_free_duty"]):
+            raise AssertionError("duty %d below stall-free duty" % d)
+        self.bus.write_emc(EMC_FAN_SETTING, d)
+        self.duty = d
+        self.written_at = self.clock()
+        self.mismatch_since = None
+
+    def full(self, why):
+        """The fail-safe (verified 0xff); returns True on success.  On failure the
+        alert is raised once per episode and self.duty is left unknown (None), so
+        every caller that tests `duty != DUTY_FULL` retries on the next poll."""
+        if not self.identified:
+            self.log("err", "full duty not attempted (%s): chip not identified" % why)
+            return False
+        ok = failsafe_full(self.bus, self.log, why, self.alert_file, self.sleep, self.clock,
+                           alert=not self.full_failed)
+        self.duty = DUTY_FULL if ok else None
+        self.full_failed = not ok
+        self.written_at = self.clock()
+        self.mismatch_since = None
+        return ok
+
+    # -- setup
+    def configure(self):
+        self.spin_s = spinup_time(self.bus)
+        start_duty = self.bus.read(EMC_ADDR, EMC_FAN_SETTING)
+        self.log("info", "duty read at start: 0x%02x (spin-up time %.2f s)" % (start_duty, self.spin_s))
+        self.duty = start_duty
+        before = {r: self.bus.read(PCA_FAN_ADDR, r) for r in (PCA_IN, PCA_OUT, PCA_POL, PCA_CFG)}
+        for reg, val in EMC_RECIPE:
+            self.bus.write_emc(reg, val)
+        self.bus.pca1c_rmw(PCA_OUT, PCA_FAN_OUT, PCA_FAN_BITS & ~PCA_FAN_OUT)
+        self.bus.pca1c_rmw(PCA_CFG, 0, PCA_FAN_BITS)
+        after = {r: self.bus.read(PCA_FAN_ADDR, r) for r in (PCA_IN, PCA_OUT, PCA_POL, PCA_CFG)}
+        self.log("info", "0x1c before IN=0x%02x OUT=0x%02x POL=0x%02x CFG=0x%02x; after IN=0x%02x OUT=0x%02x POL=0x%02x CFG=0x%02x"
+                 % (before[0], before[1], before[2], before[3], after[0], after[1], after[2], after[3]))
+        for r in (PCA_OUT, PCA_POL, PCA_CFG):
+            if (before[r] ^ after[r]) & PCA_POE_BITS:
+                self.alert("0x1c register %d bits 0/1 changed 0x%02x -> 0x%02x" % (r, before[r], after[r]))
+                raise RuntimeError("PoE bits changed")
+        return before, after
+
+    def tach_stopped(self):
+        hi = self.bus.read(EMC_ADDR, EMC_TACH_HI)
+        lo = self.bus.read(EMC_ADDR, EMC_TACH_LO)
+        count = (hi << 5) | (lo >> 3)
+        return count >= 0x1FFF, (0 if count >= 0x1FFF or count == 0 else int(3932160 / count))
+
+    def kick(self):
+        self.bus.write_emc(EMC_FAN_SETTING, int(self.cfg["kick_duty"]))
+        self.sleep(float(self.cfg["kick_s"]))
+
+    def check_duty(self):
+        """Re-assert the policy duty if 0x40 disagrees for longer than a spin-up
+        (a chip reset, or a fail-safe write by hand).  A disagreement inside the
+        spin-up window after any write is the Spin Up Routine, not an error."""
+        actual = self.bus.read(EMC_ADDR, EMC_FAN_SETTING)
+        now = self.clock()
+        if actual == self.duty:
+            self.mismatch_since = None
+            return
+        settle = self.spin_s + VERIFY_MARGIN_S
+        if self.written_at is not None and now - self.written_at < settle:
+            return
+        if self.mismatch_since is None:
+            self.mismatch_since = now
+            return
+        if now - self.mismatch_since < settle:
+            return
+        self.log("warning", "duty register reads 0x%02x, expected 0x%02x for %.1f s: rewriting"
+                 % (actual, self.duty, now - self.mismatch_since))
+        self.set_duty(self.duty)
+
+    def check_stall(self, d):
+        stopped, _ = self.tach_stopped()
+        if not stopped:
+            self.stopped_polls = 0
+            self.kicks_without_recovery = 0
+            self.stall_alerted = False
+            return
+        self.stopped_polls += 1
+        if self.stopped_polls < int(self.cfg["stall_polls"]):
+            return
+        self.stopped_polls = 0
+        if self.kicks_without_recovery >= int(self.cfg["stall_kicks"]):
+            # Latch full duty until the service restarts: a fan that stalls at
+            # the policy duty and needs repeated kicks is not trusted below
+            # full again without a person looking at it (the alert asks for one).
+            self.alert("fan stalled: tach reads stopped after %d kicks at duty %d; "
+                       "latching full duty until the service restarts"
+                       % (self.kicks_without_recovery, self.duty))
+            self.stall_alerted = True
+            self.stall_latched = True
+            self.full("fan stalled")
+            return
+        self.log("warning", "fan stalled at duty %d: kick" % self.duty)
+        self.kick()
+        self.set_duty(d)
+        self.kicks_without_recovery += 1
+
+    # -- one control step
+    def step(self):
+        t = self.temp_fn()
+        if t is None:
+            if not self.sensor_error:
+                self.log("err", "CPU temperature read failed")
+            self.sensor_error = True
+            if self.duty != DUTY_FULL:
+                self.full("sensor read error")
+            self.state = self.RUN
+            return t
+        if self.sensor_error:
+            self.log("info", "CPU temperature readable again (%.1f C)" % t)
+            self.sensor_error = False
+        self.max_temp = t if self.max_temp is None else max(self.max_temp, t)
+        c = self.cfg
+        if self.stall_latched:
+            # hold full duty whatever the temperature; retry the write if it failed
+            if self.duty != DUTY_FULL:
+                self.full("stall latch")
+            else:
+                self.check_duty()
+            self.state = self.RUN
+            self.write_state(t)
+            return t
+        if self.state is not None and self.duty is not None:
+            self.check_duty()
+        if self.state is None:
+            self.state = self.OFF if t <= c["off_c"] else self.RUN
+            if self.state == self.OFF:
+                self.set_duty(0)
+                self.log("info", "%.1f C <= %.0f C: fan off" % (t, c["off_c"]))
+        if self.state == self.OFF:
+            if t >= c["on_c"]:
+                self.kick()
+                self.state = self.RUN
+                self.stopped_polls = 0
+                self.set_duty(target_duty(t, c))
+                self.log("info", "%.1f C >= %.0f C: fan on, duty %d" % (t, c["on_c"], self.duty))
+            elif self.duty != 0:
+                self.set_duty(0)
+        else:
+            if t <= c["off_c"]:
+                self.set_duty(0)
+                self.state = self.OFF
+                self.log("info", "%.1f C <= %.0f C: fan off" % (t, c["off_c"]))
+            else:
+                d = target_duty(t, c)
+                if d != self.duty:
+                    self.set_duty(d)
+                self.check_stall(d)
+        self.write_state(t)
+        return t
+
+    def write_state(self, t):
+        if not self.state_file:
+            return
+        try:
+            stopped, rpm = self.tach_stopped()
+        except OSError:
+            stopped, rpm = None, None
+        st = {"time": time.time(), "temp_c": t, "max_temp_c": self.max_temp, "state": self.state,
+              "duty": self.duty, "rpm_approx": rpm, "tach_stopped": stopped,
+              "sensor_error": self.sensor_error, "stall_latched": self.stall_latched,
+              "full_failed": self.full_failed}
+        try:
+            os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
+            tmp = self.state_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(st, f)
+            os.replace(tmp, self.state_file)
+        except OSError:
+            pass
+
+
+# ------------------------------------------------------------------ plumbing
+def make_logger(stderr=False, kmsg=False):
+    pri = {"crit": syslog.LOG_CRIT, "err": syslog.LOG_ERR, "warning": syslog.LOG_WARNING,
+           "info": syslog.LOG_INFO, "debug": syslog.LOG_DEBUG}
+    syslog.openlog("velo5x0-fan", 0, syslog.LOG_DAEMON)
+
+    def log(level, msg):
+        syslog.syslog(pri[level], msg)
+        if kmsg:  # late shutdown: no journal; the kernel log still reaches the console
+            try:
+                with open("/dev/kmsg", "w") as k:
+                    k.write("<%d>velo5x0-fan: %s\n" % (pri[level], msg))
+            except OSError:
+                pass
+        if stderr:
+            print("%s: %s" % (level, msg), file=sys.stderr, flush=True)
+    return log
+
+
+def load_config(path=CONF_FILE):
+    cfg = dict(DEFAULTS)
+    cp = configparser.ConfigParser()
+    if os.path.exists(path):
+        cp.read(path)
+        if cp.has_section("fan"):
+            for k in DEFAULTS:
+                if cp.has_option("fan", k):
+                    cfg[k] = float(cp.get("fan", k))
+    for k in ("stall_free_duty", "kick_duty", "stall_polls", "stall_kicks"):
+        cfg[k] = int(cfg[k])
+    return cfg
+
+
+def open_bus(log):
+    dev = find_adapter()
+    if not dev:
+        log("err", "board I2C adapter \"%s\" not found (vc-edge5x0-board not loaded?); writing nothing" % ADAPTER_NAME)
+        return None
+    return GuardedBus(LinuxI2C(dev), log)
+
+
+def cmd_full(args, log):
+    """The fail-safe path: no configuration file is read."""
+    bus = open_bus(log)
+    if bus is None or not identify(bus, log, tries=IDENTIFY_TRIES_FULL, gap_s=0.5):
+        return EXIT_PRECONDITION
+    return EXIT_OK if failsafe_full(bus, log, args.why) else EXIT_WRITE_FAILED
+
+
+def cmd_run(args, log):
+    bus = open_bus(log)
+    if bus is None or not identify(bus, log, tries=IDENTIFY_TRIES_RUN, gap_s=2.0):
+        return EXIT_PRECONDITION
+    c = None
+    try:
+        cfg = load_config()
+        c = Controller(bus, read_coretemp, cfg, log, state_file=STATE_FILE, alert_file=ALERT_FILE)
+        c.identified = True
+        stop = {"flag": False}
+
+        def on_term(signum, frame):
+            stop["flag"] = True
+        signal.signal(signal.SIGTERM, on_term)
+        signal.signal(signal.SIGINT, on_term)
+        log("info", "start: off %.0f C, on %.0f C, full %.0f C, stall-free duty %d"
+            % (cfg["off_c"], cfg["on_c"], cfg["full_c"], cfg["stall_free_duty"]))
+        c.configure()
+        sd_notify("READY=1")
+        while not stop["flag"]:
+            c.step()
+            sd_notify("WATCHDOG=1")
+            c.sleep(float(cfg["poll_s"]))
+    except Exception as e:  # any failure after identification, config errors included
+        log("err", "control failure: %r" % (e,))
+        failsafe_full(bus, log, "control failure")
+        return EXIT_WRITE_FAILED
+    sd_notify("STOPPING=1")
+    return EXIT_OK if failsafe_full(bus, log, "service stop") else EXIT_WRITE_FAILED
+
+
+def cmd_probe(args, log):
+    dev = find_adapter()
+    out = {"adapter": dev, "coretemp_c": read_coretemp()}
+    if dev:
+        bus = GuardedBus(LinuxI2C(dev), log)
+
+        def rd(a, r):
+            try:
+                return "0x%02x" % bus.read(a, r)
+            except OSError as e:
+                return "error %s" % e.errno
+        out["emc2104"] = {"0x%02x" % r: rd(EMC_ADDR, r)
+                          for r in (EMC_PRODUCT_ID_REG, EMC_FAN_SETTING, EMC_PWM_DIVIDE, EMC_FAN_CONFIG1,
+                                    EMC_SPINUP_CFG, EMC_PWM_BASE, EMC_LUT_CONFIG, EMC_TACH_HI,
+                                    EMC_TACH_LO) + EMC_TEMP_REGS}
+        out["pca9557_0x1c"] = {n: rd(PCA_FAN_ADDR, r) for n, r in
+                               (("in", PCA_IN), ("out", PCA_OUT), ("pol", PCA_POL), ("cfg", PCA_CFG))}
+    print(json.dumps(out, indent=1))
+    return EXIT_OK
+
+
+def cmd_sweep(args, log):
+    """Calibration (VBSP-OPEN-11): from full duty step down until the tach
+    reports stopped; always ends at verified full duty."""
+    bus = open_bus(log)
+    if bus is None or not identify(bus, log):
+        return EXIT_PRECONDITION
+    try:
+        c = Controller(bus, read_coretemp, dict(DEFAULTS), log, alert_file=ALERT_FILE)
+        c.identified = True
+        c.configure()
+        bus.write_emc(EMC_FAN_SETTING, DUTY_FULL)
+        time.sleep(args.settle)
+        for d in range(args.start, args.stop - 1, -args.step):
+            bus.write_emc(EMC_FAN_SETTING, d)
+            time.sleep(args.settle)
+            stopped, rpm = c.tach_stopped()
+            print(json.dumps({"duty": d, "rpm_approx": rpm, "stopped": stopped}), flush=True)
+            if stopped:
+                break
+    finally:
+        ok = failsafe_full(bus, log, "sweep end")
+    return EXIT_OK if ok else EXIT_WRITE_FAILED
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="velo5x0-fan")
+    ap.add_argument("--kmsg", action="store_true", help="also log to /dev/kmsg (late shutdown)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("run")
+    f = sub.add_parser("full")
+    f.add_argument("--why", default="fail-safe")
+    sub.add_parser("probe")
+    s = sub.add_parser("sweep")
+    s.add_argument("--start", type=int, default=128)
+    s.add_argument("--stop", type=int, default=8)
+    s.add_argument("--step", type=int, default=4)
+    s.add_argument("--settle", type=float, default=4.0)
+    args = ap.parse_args(argv)
+    log = make_logger(stderr=sys.stderr.isatty(), kmsg=args.kmsg)
+    return {"run": cmd_run, "full": cmd_full, "probe": cmd_probe,
+            "sweep": cmd_sweep}[args.cmd](args, log)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

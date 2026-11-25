@@ -1,0 +1,177 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0
+"""velo5x0-check: read-only acceptance checks for the velo5x0-bsp board support.
+
+Prints one line per check: PASS / FAIL / NOT RUN, with evidence.  Writes nothing.
+Covers VBSP-REQ-1, the naming part of VBSP-REQ-2, VBSP-REQ-13, the board and
+switch module state (unmanaged, or DSA with lan1..lan8 per the jack map), and
+which igb is loaded.  Link speed is reported for any
+port with carrier; traffic tests are separate (they need a peer).
+"""
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+
+results = []
+
+
+def rd(p, default=None):
+    try:
+        with open(p) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def check(req, name, status, evidence):
+    results.append({"req": req, "check": name, "status": status, "evidence": evidence})
+
+
+def drv(pci):
+    l = os.path.realpath("/sys/bus/pci/devices/%s/driver" % pci)
+    return os.path.basename(l) if os.path.exists("/sys/bus/pci/devices/%s/driver" % pci) else None
+
+
+def nets(pci):
+    return sorted(os.listdir("/sys/bus/pci/devices/%s/net" % pci)) if os.path.isdir("/sys/bus/pci/devices/%s/net" % pci) else []
+
+
+def kernel_log():
+    try:
+        return subprocess.run(["journalctl", "-k", "-b", "--no-pager", "-o", "cat"],
+                              capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+# jack map (VBSP-HW-JACKS): lanN -> (PCI function of the switch's conduit, switch port)
+JACKS = {"lan1": ("0000:00:14.1", 1), "lan2": ("0000:00:14.1", 0), "lan3": ("0000:00:14.1", 3),
+         "lan4": ("0000:00:14.1", 2), "lan5": ("0000:00:14.0", 2), "lan6": ("0000:00:14.0", 0),
+         "lan7": ("0000:00:14.0", 1), "lan8": ("0000:00:14.0", 3)}
+
+
+def check_dsa(st):
+    """DSA mode (velo5x0-bsp +velo5x0dsa kernel, vc-edge5x0-dsa loaded)."""
+    heads = [l for l in st.splitlines() if l.startswith("switch")]
+    check("D1c", "both switches registered and bound to mv88e6085",
+          "PASS" if len(heads) == 2 and all("registered bound driver mv88e6085" in l for l in heads) else "FAIL", heads)
+    # The CPU link (switch port 4 SerDes) only links once the conduit is up,
+    # which DSA does when a lanN is opened; at boot it reads "link down".
+    # So: the bring-up must have run without error, and the live port 4
+    # status (bit 11, link) is judged only while the conduit is up.
+    ran = len(heads) == 2 and all("cpu-link up:" in l for l in heads)
+    p4 = re.findall(r"port 4 status (0x[0-9a-f]+)", st)
+    cond_up = [rd("/sys/class/net/%s/operstate" % (nets(p) or ["?"])[0]) == "up"
+               for p in ("0000:00:14.0", "0000:00:14.1")]
+    if not ran:
+        check("D3", "both CPU links brought up after DSA bind", "FAIL", heads)
+    elif not all(cond_up):
+        check("D3", "both CPU links have link", "NOT RUN",
+              {"reason": "a conduit is down (no lanN of that switch is up)", "port4_status": p4,
+               "conduit_up": cond_up})
+    else:
+        check("D3", "both CPU links have link",
+              "PASS" if len(p4) == 2 and all(int(x, 16) & 0x0800 for x in p4) else "FAIL",
+              {"port4_status": p4})
+    p56 = re.findall(r"port [56] status \S+ physctrl \S+ ctrl \S+ state (\w+)", st)
+    check("R4", "ports 5 and 6 disabled on both switches",
+          "PASS" if len(p56) == 4 and all(x == "disabled" for x in p56) else "FAIL", p56)
+    conduit = {}
+    for pci in ("0000:00:14.0", "0000:00:14.1"):
+        n = nets(pci)
+        conduit[pci] = rd("/sys/class/net/%s/ifindex" % n[0]) if n else None
+    for name, (pci, port) in sorted(JACKS.items()):
+        base = "/sys/class/net/%s" % name
+        if not os.path.isdir(base):
+            check("R3", "%s exists (jack %s = switch %s port %d)" % (name, name.upper(), "AB"[pci.endswith("1")], port),
+                  "FAIL", "no such interface")
+            continue
+        iflink, ppn = rd(base + "/iflink"), rd(base + "/phys_port_name")
+        ok = iflink is not None and iflink == conduit[pci] and ppn == "p%d" % port
+        check("R3", "%s is jack %s (switch %s port %d)" % (name, name.upper(), "AB"[pci.endswith("1")], port),
+              "PASS" if ok else "FAIL",
+              {"iflink": iflink, "conduit_ifindex": conduit[pci], "phys_port_name": ppn,
+               "carrier": rd(base + "/carrier"), "operstate": rd(base + "/operstate"),
+               "speed": rd(base + "/speed"), "duplex": rd(base + "/duplex")})
+
+
+def main():
+    klog = kernel_log()
+    i354 = ["0000:00:14.%d" % f for f in range(4)]
+    bound = {p: drv(p) for p in i354}
+    fails = [l for l in klog.splitlines() if re.search(r"igb 0000:00:14\.\d: probe with driver igb failed", l)]
+    check("R1", "00:14.0-3 bound to igb, no probe failure",
+          "PASS" if all(v == "igb" for v in bound.values()) and not fails else "FAIL",
+          {"drivers": bound, "probe_failure_lines": len(fails)})
+
+    ours = os.path.exists("/sys/module/igb/parameters/vc_ext_mdio")
+    check("D1b", "loaded igb is the velo5x0-bsp igb", "PASS" if ours else "FAIL",
+          {"vc_ext_mdio": rd("/sys/module/igb/parameters/vc_ext_mdio")})
+
+    for n, pci in (("ge1", "0000:00:14.2"), ("ge2", "0000:00:14.3")):
+        have = nets(pci)
+        check("R2", "%s is the interface of %s" % (n, pci), "PASS" if have == [n] else "FAIL",
+              {"interfaces": have})
+        if have:
+            i = have[0]
+            car = rd("/sys/class/net/%s/carrier" % i)
+            if car == "1":
+                sp, dx = rd("/sys/class/net/%s/speed" % i), rd("/sys/class/net/%s/duplex" % i)
+                check("R2", "%s link 1000/full" % n, "PASS" if (sp, dx) == ("1000", "full") else "FAIL",
+                      {"speed": sp, "duplex": dx})
+            else:
+                check("R2", "%s link 1000/full" % n, "NOT RUN",
+                      {"carrier": car, "operstate": rd("/sys/class/net/%s/operstate" % i)})
+    macmatch = []
+    for f in glob.glob("/usr/lib/systemd/network/10-velo5x0-ge*.link"):
+        txt = rd(f, "")
+        if re.search(r"^\s*(MACAddress|PermanentMACAddress)\s*=", txt, re.M):
+            macmatch.append(f)
+    check("R2", ".link files match PCI path, not MAC", "PASS" if not macmatch else "FAIL",
+          {"files_matching_mac": macmatch})
+
+    i350 = sorted(os.path.basename(p) for p in glob.glob("/sys/bus/pci/devices/0000:04:00.*"))
+    st = {p: {"driver": drv(p), "net": nets(p)} for p in i350}
+    check("R13", "I350 04:00.x bound to igb with an interface",
+          "PASS" if i350 and all(v["driver"] == "igb" and v["net"] for v in st.values()) else "FAIL", st)
+
+    check("D1a", "board module reset sequence", "PASS" if (rd("/sys/module/vc_edge5x0_board/parameters/reset_result", "") or "").startswith("done") else "FAIL",
+          {"reset_result": rd("/sys/module/vc_edge5x0_board/parameters/reset_result"),
+           "i2c_adapter": rd("/sys/module/vc_edge5x0_board/parameters/i2c_adapter")})
+    phy = [l for l in klog.splitlines() if "vc-edge5x0-wan PHY" in l]
+    check("D1a", "WAN PHY IDs on vc-edge5x0-wan", "PASS" if len(phy) >= 2 and all("0141:0dd" in l for l in phy[-2:]) else "FAIL",
+          {"lines": phy[-2:]})
+
+    dsa = rd("/sys/devices/platform/vc-edge5x0-dsa/status")
+    sw = rd("/sys/devices/platform/vc-edge5x0-switch/status")
+    if dsa is not None:
+        check_dsa(dsa)
+    elif sw is None:
+        check("D3", "switch CPU links", "FAIL", "vc-edge5x0-switch status not present")
+    else:
+        up = sw.count(": up:")
+        p56 = re.findall(r"port [56] status \S+ physctrl \S+ ctrl \S+ state (\w+)", sw)
+        check("D3", "both switches up", "PASS" if up == 2 else "FAIL", [l for l in sw.splitlines() if l.startswith("switch")])
+        check("R4", "ports 5 and 6 disabled on both switches",
+              "PASS" if len(p56) == 4 and all(s == "disabled" for s in p56) else "FAIL", p56)
+
+    for u in ("velo5x0-fan-failsafe.service", "velo5x0-fand.service"):
+        try:
+            a = subprocess.run(["systemctl", "is-active", u], capture_output=True, text=True).stdout.strip()
+        except OSError:
+            a = "unknown"
+        check("R10", u, "PASS" if a == "active" else ("NOT RUN" if rd("/sys/class/dmi/id/board_name") != "EDGE540" else "FAIL"), a)
+
+    if "--json" in sys.argv:
+        print(json.dumps(results, indent=1))
+    else:
+        for r in results:
+            print("%-7s %-4s %s :: %s" % (r["status"], r["req"], r["check"], json.dumps(r["evidence"])))
+    return 1 if any(r["status"] == "FAIL" for r in results) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

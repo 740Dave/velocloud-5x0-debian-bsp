@@ -1,0 +1,6 @@
+#!/bin/sh
+# velo5x0-bsp: kernel postinst, after dkms, before initramfs-tools (VBSP-REQ-5)
+# The hook stays (a conffile) after the package is removed: do nothing then.
+G=/usr/lib/velo5x0-bsp/velo5x0-kernel-guard
+[ -x "$G" ] || exit 0
+exec "$G" image "$@"

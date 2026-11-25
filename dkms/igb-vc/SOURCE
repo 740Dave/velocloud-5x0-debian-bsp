@@ -1,0 +1,5 @@
+drivers/net/ethernet/intel/igb/ in this directory is byte-identical to
+Debian linux-source-6.12, version 6.12.118-1 (trixie-security),
+drivers/net/ethernet/intel/igb/, licence GPL-2.0.  sha256 per file: SOURCE.sha256.
+Patches applied by dkms at build time: patches/200 (velo540openwrt, GPL-2.0),
+patches/201 (velo5x0-bsp).  See PROVENANCE.md.

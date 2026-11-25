@@ -1,0 +1,165 @@
+velo5x0-bsp local changes to the lifted igb glue (applied after patch 200)
+  licence:   GPL-2.0, as the files it changes
+  changes:   (1) the default external MDIO bus id becomes "vc-edge5x0-wan", the
+             bus vc-edge5x0-board registers (the stock Debian kernel has no
+             mdio-gpio, so upstream's "gpio-0" never exists there);
+             (2) igb takes a module reference on the provider of that bus
+             (try_module_get(bus->owner)) while it holds the bus, and drops
+             it in igb_vc_mii_unregister(), so vc-edge5x0-board cannot be
+             unloaded under a bound igb;
+             (3) the external-MDIO PHY accessors refuse (WARN_ONCE, return
+             -E1000_ERR_PHY) when called outside task context or with
+             preemption/IRQs off: mdiobus_read/write take a mutex;
+             (4) the PHY-info refresh moves from phy_info_timer (softirq) to a
+             work item, phy_info_task; the timer only schedules it, and
+             igb_down and igb_remove cancel it after del_timer_sync;
+             (5) igb_remove unregisters the external buses after
+             unregister_netdev, not before.
+
+diff -ruN -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x '.*' -x Module.symvers -x modules.order a/drivers/net/ethernet/intel/igb/igb.h b/drivers/net/ethernet/intel/igb/igb.h
+--- a/drivers/net/ethernet/intel/igb/igb.h	2026-11-24 08:01:23.249654283 +0000
++++ b/drivers/net/ethernet/intel/igb/igb.h	2026-11-24 10:23:36.556975906 +0000
+@@ -565,6 +565,9 @@
+ 
+ 	struct timer_list watchdog_timer;
+ 	struct timer_list phy_info_timer;
++	/* velo5x0-bsp: the PHY-info refresh runs here, in process context,
++	 * because a PHY behind an external MDIO bus is accessed under a mutex */
++	struct work_struct phy_info_task;
+ 
+ 	u16 mng_vlan_id;
+ 	u32 bd_number;
+diff -ruN -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x '.*' -x Module.symvers -x modules.order a/drivers/net/ethernet/intel/igb/igb_main.c b/drivers/net/ethernet/intel/igb/igb_main.c
+--- a/drivers/net/ethernet/intel/igb/igb_main.c	2026-11-24 08:01:23.273654365 +0000
++++ b/drivers/net/ethernet/intel/igb/igb_main.c	2026-11-24 10:24:04.877086727 +0000
+@@ -120,6 +120,7 @@
+ static void igb_clean_rx_ring(struct igb_ring *);
+ static void igb_set_rx_mode(struct net_device *);
+ static void igb_update_phy_info(struct timer_list *);
++static void igb_phy_info_task(struct work_struct *);
+ static void igb_watchdog(struct timer_list *);
+ static void igb_watchdog_task(struct work_struct *);
+ static netdev_tx_t igb_xmit_frame(struct sk_buff *skb, struct net_device *);
+@@ -2181,6 +2182,7 @@
+ 
+ 	del_timer_sync(&adapter->watchdog_timer);
+ 	del_timer_sync(&adapter->phy_info_timer);
++	cancel_work_sync(&adapter->phy_info_task);
+ 
+ 	/* record the stats before reset*/
+ 	spin_lock(&adapter->stats64_lock);
+@@ -3402,6 +3404,7 @@
+ 
+ 	timer_setup(&adapter->watchdog_timer, igb_watchdog, 0);
+ 	timer_setup(&adapter->phy_info_timer, igb_update_phy_info, 0);
++	INIT_WORK(&adapter->phy_info_task, igb_phy_info_task);
+ 
+ 	INIT_WORK(&adapter->reset_task, igb_reset_task);
+ 	INIT_WORK(&adapter->watchdog_task, igb_watchdog_task);
+@@ -3870,6 +3873,7 @@
+ 	set_bit(__IGB_DOWN, &adapter->state);
+ 	del_timer_sync(&adapter->watchdog_timer);
+ 	del_timer_sync(&adapter->phy_info_timer);
++	cancel_work_sync(&adapter->phy_info_task);
+ 
+ 	cancel_work_sync(&adapter->reset_task);
+ 	cancel_work_sync(&adapter->watchdog_task);
+@@ -3892,8 +3896,9 @@
+ 	igb_disable_sriov(pdev, false);
+ #endif
+ 
+-	igb_vc_mii_unregister(adapter);
+ 	unregister_netdev(netdev);
++	/* velo5x0-bsp: after the netdev is gone, so nothing can reach the PHY */
++	igb_vc_mii_unregister(adapter);
+ 
+ 	igb_clear_interrupt_scheme(adapter);
+ 
+@@ -5406,6 +5411,18 @@
+ static void igb_update_phy_info(struct timer_list *t)
+ {
+ 	struct igb_adapter *adapter = from_timer(adapter, t, phy_info_timer);
++
++	/* velo5x0-bsp: never touch the PHY from the timer (softirq); the PHY
++	 * of an external-MDIO port is reached under a mutex
++	 */
++	schedule_work(&adapter->phy_info_task);
++}
++
++static void igb_phy_info_task(struct work_struct *work)
++{
++	struct igb_adapter *adapter = container_of(work, struct igb_adapter,
++						   phy_info_task);
++
+ 	igb_get_phy_info(&adapter->hw);
+ }
+ 
+diff -ruN -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x '.*' -x Module.symvers -x modules.order a/drivers/net/ethernet/intel/igb/igb_vc.c b/drivers/net/ethernet/intel/igb/igb_vc.c
+--- a/drivers/net/ethernet/intel/igb/igb_vc.c	2026-11-24 08:01:23.281654392 +0000
++++ b/drivers/net/ethernet/intel/igb/igb_vc.c	2026-11-24 10:23:36.580975999 +0000
+@@ -37,6 +37,7 @@
+ #include <linux/phy.h>
+ #include <linux/bitfield.h>
+ #include <linux/delay.h>
++#include <linux/preempt.h>
+ 
+ #include "e1000_mac.h"
+ #include "e1000_82575.h"
+@@ -48,9 +49,10 @@
+ #define IGB_VC_ID_EDGE5X0	0x3558	/* "5X" edge520/edge540 */
+ 
+ /* mii_bus id of the external bit-bang bus carrying the 88E1514 WAN PHYs.
+- * mdio-gpio names its bus "gpio-<pdev id in hex>".
++ * velo5x0-bsp: the stock Debian kernel has no mdio-gpio; the bus is
++ * registered by vc-edge5x0-board as "vc-edge5x0-wan".
+  */
+-static char *vc_ext_mdio = "gpio-0";
++static char *vc_ext_mdio = "vc-edge5x0-wan";
+ module_param(vc_ext_mdio, charp, 0444);
+ MODULE_PARM_DESC(vc_ext_mdio,
+ 		 "VeloCloud edge5x0: id of the external MDIO bus with the 88E1514 WAN PHYs");
+@@ -147,6 +149,11 @@
+ 	struct mii_bus *bus = hw->dev_spec._82575.vc_ext_bus;
+ 	int ret;
+ 
++	/* velo5x0-bsp: mdiobus_read() takes a mutex; fail rather than sleep
++	 * in atomic context (softirq, IRQ, or a spinlock/preempt-off region)
++	 */
++	if (WARN_ONCE(!in_task() || !preemptible(), "igb-vc: ext MDIO from atomic ctx"))
++		return -E1000_ERR_PHY;
+ 	if (!bus || offset > MAX_PHY_REG_ADDRESS)
+ 		return -E1000_ERR_PARAM;
+ 
+@@ -161,6 +168,9 @@
+ {
+ 	struct mii_bus *bus = hw->dev_spec._82575.vc_ext_bus;
+ 
++	/* velo5x0-bsp: mdiobus_write() takes a mutex; fail rather than sleep */
++	if (WARN_ONCE(!in_task() || !preemptible(), "igb-vc: ext MDIO from atomic ctx"))
++		return -E1000_ERR_PHY;
+ 	if (!bus || offset > MAX_PHY_REG_ADDRESS)
+ 		return -E1000_ERR_PARAM;
+ 
+@@ -245,6 +255,14 @@
+ 				 vc_ext_mdio);
+ 			return -EPROBE_DEFER;
+ 		}
++		/* velo5x0-bsp: pin the module that provides the bus
++		 * (vc-edge5x0-board) while this function holds it: unloading it
++		 * under a bound igb would leave PHY accesses calling freed code.
++		 */
++		if (!try_module_get(bus->owner)) {
++			put_device(&bus->dev);
++			return -EPROBE_DEFER;
++		}
+ 		dev_spec->vc_role = IGB_VC_ROLE_EXTPHY;
+ 		dev_spec->vc_ext_bus = bus;
+ 		hw->phy.addr = func - 2;
+@@ -301,6 +319,7 @@
+ 		dev_spec->vc_mii = NULL;
+ 	}
+ 	if (dev_spec->vc_ext_bus) {
++		module_put(dev_spec->vc_ext_bus->owner);	/* velo5x0-bsp: ref from igb_vc_probe() */
+ 		put_device(&dev_spec->vc_ext_bus->dev);	/* ref from mdio_find_bus() */
+ 		dev_spec->vc_ext_bus = NULL;
+ 	}

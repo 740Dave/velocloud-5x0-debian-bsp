@@ -1,0 +1,26 @@
+# velo5x0-bsp (VBSP-REQ-10, VBSP-DES-5): fan off when cool, on when needed,
+# never below the stall-free duty, full duty on stop, crash or kill.
+[Unit]
+Description=VeloCloud Edge 540 fan control
+Documentation=file:/usr/share/doc/velo5x0-bsp/README.md
+ConditionFirmware=smbios-field(board_name = EDGE540)
+Requires=velo5x0-fan-failsafe.service
+After=velo5x0-fan-failsafe.service
+
+[Service]
+# READY=1 after the chip is configured; WATCHDOG=1 every poll.  A hung loop
+# misses the watchdog, systemd kills it (SIGABRT), ExecStopPost forces full
+# duty, and Restart= starts it again.
+Type=notify
+NotifyAccess=main
+WatchdogSec=30
+ExecStart=/usr/sbin/velo5x0-fan run
+# runs after a normal stop, a crash and a SIGKILL alike
+ExecStopPost=/usr/sbin/velo5x0-fan full --why service-stopped
+Restart=on-failure
+RestartSec=5
+# exit 2 = no EMC2104 identified, nothing written: do not retry forever
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+#!/bin/sh
+# velo5x0-bsp: if igb loads in the initramfs, the board module and its
+# ordering must be there too (VBSP-REQ-6), and the ge1/ge2 names.  On a
+# kernel that has the DSA glue (+velo5x0dsa), also the glue, mv88e6xxx and
+# the Marvell tag driver, because igb's softdep loads the glue here.
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in prereqs) prereqs; exit 0 ;; esac
+. /usr/share/initramfs-tools/hook-functions
+manual_add_modules i2c-algo-bit libphy vc-edge5x0-board vc-edge5x0-switch igb
+if modinfo -k "${version}" vc-edge5x0-dsa >/dev/null 2>&1; then
+	manual_add_modules vc-edge5x0-dsa mv88e6xxx tag_dsa
+fi
+for f in /usr/lib/modprobe.d/velo5x0-bsp.conf \
+	 /usr/lib/systemd/network/10-velo5x0-ge1.link \
+	 /usr/lib/systemd/network/10-velo5x0-ge2.link; do
+	[ -e "$f" ] && copy_file config "$f"
+done
+exit 0

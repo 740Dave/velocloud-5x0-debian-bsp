@@ -1,0 +1,356 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# velo5x0-kernel-build: rebuild a Debian 13 6.12-series kernel with DSA for the
+# VeloCloud Edge 5x0 LAN switches (velo5x0-bsp, VBSP-OPEN-28 option 1).
+#
+# Input : a Debian kernel package version, e.g. 6.12.118-1.
+# Output: linux-image-<KR>, linux-headers-<KR> (and linux-image-<KR>-dbg)
+#         .debs, where KR = <upstream>+velo5x0dsa<REV>, e.g. 6.12.118+velo5x0dsa1,
+#         plus BUILD-MANIFEST.txt (sources, sha256s, config delta, patches).
+#
+# What changes relative to Debian's own amd64 kernel of the same version:
+#   * source: Debian's linux-source-6.12 of that version, plus the patches in
+#     ../kernel-build/patches (today only 230: each platform-data DSA switch
+#     gets its own tree, so the two 88E6176 chips can both register);
+#   * config: Debian's config.amd64_none_amd64 from linux-config-6.12 of the
+#     same version, plus config/velo5x0-dsa.config, then olddefconfig.  The
+#     script FAILS if olddefconfig changed any symbol Debian had set (other
+#     than the fragment's own), or turned on any new symbol outside
+#     NEW_SYMBOL_ALLOW; the full delta is written to the manifest;
+#   * the kernel release has the suffix +velo5x0dsa<REV> and is never the same
+#     name as any Debian package; the package version is <debver>+velo5x0dsa<REV>.
+#   * the kernel and modules are not signed by Debian (Secure Boot is off on
+#     the 5x0); modules are signed with a key generated for this build.
+# Never install the linux-libc-dev .deb this also produces: it would replace
+# Debian's.
+#
+# Runs on Debian 13 (a trixie container is fine), amd64 natively or any other
+# architecture by cross-compiling.  Needs root only for --install-deps.
+#
+# Usage:
+#   velo5x0-kernel-build --debian-version 6.12.118-1 [--rev 1] [--workdir DIR]
+#                        [--outdir DIR] [--jobs N] [--install-deps]
+#                        [--snapshot YYYYMMDDTHHMMSSZ]
+#                        [--source-only] [--resume]
+#   --snapshot   also use snapshot.debian.org (signed, at that timestamp) for a
+#                version that has left the live archive.
+#   Debian's debug info and BTF are kept (as Debian builds it): the build
+#                tree needs about 25 GB of disk.
+#   --source-only  prepare and configure the tree, then stop (no compile).
+#   --resume     use the existing tree for this release (after an interrupted
+#                or failed run): re-check its config, re-run the (incremental)
+#                package build unless its .debs are already there, then fix
+#                and verify as usual.
+#
+# Cross-building (any non-amd64 host): the headers package that bindeb-pkg
+# makes then holds host-architecture copies of tools/objtool/objtool and
+# tools/bpf/resolve_btfids/resolve_btfids, which DKMS runs on the box.  The
+# script rebuilds both for x86-64 and repacks the headers .deb; to do so
+# (their own build runs helpers it has just compiled) the host must be able
+# to execute amd64 binaries (binfmt: Docker Desktop and qemu-user-static
+# provide it).  The script checks that and stops if it cannot.
+set -euo pipefail
+umask 022
+export LC_ALL=C
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+DEBVER="" REV=1 WORK=/build/work OUT=/build/out JOBS=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN) INSTALL_DEPS=0
+SNAPSHOT="" SOURCE_ONLY=0 RESUME=0
+# new symbols olddefconfig may turn on, beyond the fragment: DSA dependencies,
+# and MODULE_SIG_ALL, which linux-config-6.12 omits because Debian signs its
+# modules in a separate package (here the build signs them with its own key)
+NEW_SYMBOL_ALLOW='^CONFIG_(NET_DSA[A-Z0-9_]*|MODULE_SIG_ALL)$'
+
+die() { echo "velo5x0-kernel-build: ERROR: $*" >&2; exit 1; }
+log() { echo "velo5x0-kernel-build: $*" >&2; }
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--debian-version) DEBVER=$2; shift 2 ;;
+	--rev) REV=$2; shift 2 ;;
+	--workdir) WORK=$2; shift 2 ;;
+	--outdir) OUT=$2; shift 2 ;;
+	--jobs) JOBS=$2; shift 2 ;;
+	--install-deps) INSTALL_DEPS=1; shift ;;
+	--snapshot) SNAPSHOT=$2; shift 2 ;;
+	--source-only) SOURCE_ONLY=1; shift ;;
+	--resume) RESUME=1; shift ;;
+	-h | --help) sed -n '2,40p' "$0"; exit 0 ;;
+	*) die "unknown argument $1" ;;
+	esac
+done
+
+[ -n "$DEBVER" ] || die "--debian-version is required (e.g. 6.12.118-1)"
+case "$DEBVER" in
+6.12.*-*) ;;
+*) die "only Debian 6.12-series kernels are qualified (got $DEBVER)" ;;
+esac
+case "$REV" in '' | *[!0-9]*) die "--rev must be a number" ;; esac
+UPSTREAM=${DEBVER%%-*}                 # 6.12.118
+SUFFIX="+velo5x0dsa$REV"
+KR="$UPSTREAM$SUFFIX"                  # 6.12.118+velo5x0dsa1
+PKGVER="$DEBVER+velo5x0dsa$REV"        # 6.12.118-1+velo5x0dsa1
+grep -q '^VERSION_CODENAME=trixie' /etc/os-release || die "run on Debian 13 (trixie)"
+
+HOSTARCH=$(dpkg --print-architecture)
+# the compiler Debian names in CONFIG_CC_VERSION_TEXT (x86_64-linux-gnu-gcc-14),
+# natively on amd64 or as the cross compiler elsewhere
+CROSS=(CC=x86_64-linux-gnu-gcc-14)
+if [ "$HOSTARCH" != amd64 ]; then
+	CROSS+=(ARCH=x86_64 CROSS_COMPILE=x86_64-linux-gnu-)
+fi
+
+# ------------------------------------------------------------ dependencies
+if [ "$INSTALL_DEPS" = 1 ]; then
+	[ "$(id -u)" = 0 ] || die "--install-deps needs root"
+	export DEBIAN_FRONTEND=noninteractive
+	dpkg --print-foreign-architectures | grep -qx amd64 || [ "$HOSTARCH" = amd64 ] ||
+		dpkg --add-architecture amd64
+	if [ -n "$SNAPSHOT" ]; then
+		cat >/etc/apt/sources.list.d/velo5x0-snapshot.sources <<EOF
+Types: deb
+URIs: https://snapshot.debian.org/archive/debian/$SNAPSHOT/
+Suites: trixie trixie-updates
+Components: main
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+Check-Valid-Until: no
+
+Types: deb
+URIs: https://snapshot.debian.org/archive/debian-security/$SNAPSHOT/
+Suites: trixie-security
+Components: main
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+Check-Valid-Until: no
+EOF
+	fi
+	apt-get update -qq
+	pkgs=(build-essential bc bison flex libssl-dev libelf-dev dwarves kmod cpio
+		rsync xz-utils zstd python3 dpkg-dev debhelper fakeroot file patch ca-certificates)
+	if [ "$HOSTARCH" != amd64 ]; then
+		pkgs+=(crossbuild-essential-amd64 libssl-dev:amd64 libelf-dev:amd64 zlib1g-dev:amd64)
+	fi
+	apt-get install -y -qq --no-install-recommends "${pkgs[@]}" >/dev/null
+fi
+for t in bc bison flex dpkg-buildpackage dpkg-deb patch file; do
+	command -v "$t" >/dev/null || die "missing tool $t (use --install-deps)"
+done
+command -v x86_64-linux-gnu-gcc-14 >/dev/null ||
+	die "missing x86_64-linux-gnu-gcc-14 (use --install-deps)"
+
+# ------------------------------------------------------------ sources
+mkdir -p "$WORK" "$OUT"
+DL="$WORK/dl-$DEBVER"
+mkdir -p "$DL"
+(
+	cd "$DL"
+	# apt verifies each .deb against the signed archive index
+	[ -e linux-source-6.12_"$DEBVER"_all.deb ] ||
+		apt-get download "linux-source-6.12=$DEBVER" ||
+		die "linux-source-6.12=$DEBVER not in any configured archive (try --snapshot)"
+	[ -e linux-config-6.12_"$DEBVER"_amd64.deb ] ||
+		apt-get download "linux-config-6.12:amd64=$DEBVER" ||
+		die "linux-config-6.12:amd64=$DEBVER not in any configured archive (try --snapshot)"
+)
+SRCDEB="$DL/linux-source-6.12_${DEBVER}_all.deb"
+CFGDEB="$DL/linux-config-6.12_${DEBVER}_amd64.deb"
+
+TREE="$WORK/linux-$KR"
+if [ "$RESUME" = 1 ]; then
+	[ -e "$TREE/.config" ] || die "--resume: no configured tree $TREE"
+elif [ -e "$TREE" ]; then
+	die "$TREE exists; this script never deletes: remove it by hand, use --resume, or another --rev/--workdir"
+fi
+X="$WORK/x-$DEBVER"
+if [ ! -e "$X/usr/src/linux-source-6.12.tar.xz" ]; then
+	mkdir -p "$X"
+	dpkg-deb -x "$SRCDEB" "$X"
+	dpkg-deb -x "$CFGDEB" "$X"
+fi
+DEBCFG="$X/usr/src/linux-config-6.12/config.amd64_none_amd64.xz"
+[ -e "$DEBCFG" ] || die "Debian config $DEBCFG missing from linux-config-6.12"
+FRAG="$HERE/config/velo5x0-dsa.config"
+FRAGS=("$FRAG")
+PATCHES=()
+for p in "$HERE"/patches/*.patch; do
+	[ -e "$p" ] && PATCHES+=("$(basename "$p") $(sha256sum "$p" | cut -d' ' -f1)")
+done
+if [ "$RESUME" = 0 ]; then
+log "unpacking Debian source $DEBVER into $TREE"
+mkdir -p "$TREE"
+tar -xf "$X/usr/src/linux-source-6.12.tar.xz" -C "$TREE" --strip-components=1
+grep -q "^SUBLEVEL = ${UPSTREAM##*.}\$" "$TREE/Makefile" ||
+	die "source tree SUBLEVEL does not match $UPSTREAM"
+
+# ------------------------------------------------------------ patches
+for p in "$HERE"/patches/*.patch; do
+	[ -e "$p" ] || continue
+	log "patch $(basename "$p"): dry run"
+	patch -d "$TREE" -p1 --forward --dry-run <"$p" >"$WORK/patch-$(basename "$p").log" ||
+		die "patch $(basename "$p") does not apply to Debian $DEBVER: port it, then rerun"
+	grep -Eq 'offset|fuzz' "$WORK/patch-$(basename "$p").log" &&
+		log "WARNING: patch $(basename "$p") applies with offset or fuzz: $(cat "$WORK/patch-$(basename "$p").log")"
+	patch -d "$TREE" -p1 --forward -s <"$p"
+done
+
+# ------------------------------------------------------------ config
+xz -dc "$DEBCFG" >"$TREE/.config"
+for f in "${FRAGS[@]}"; do
+	while IFS= read -r line; do
+		case "$line" in
+		CONFIG_*=*) k=${line%%=*}; v=${line#*=}
+			case "$v" in
+			y) "$TREE/scripts/config" --file "$TREE/.config" --enable "${k#CONFIG_}" ;;
+			m) "$TREE/scripts/config" --file "$TREE/.config" --module "${k#CONFIG_}" ;;
+			\"*\") v=${v#\"}; v=${v%\"}
+				"$TREE/scripts/config" --file "$TREE/.config" --set-str "${k#CONFIG_}" "$v" ;;
+			*) "$TREE/scripts/config" --file "$TREE/.config" --set-val "${k#CONFIG_}" "$v" ;;
+			esac ;;
+		"# CONFIG_"*" is not set") k=${line#\# }; k=${k%% *}
+			"$TREE/scripts/config" --file "$TREE/.config" --disable "${k#CONFIG_}" ;;
+		esac
+	done <"$f"
+done
+make -C "$TREE" "${CROSS[@]}" olddefconfig >/dev/null
+fi	# RESUME = 0
+xz -dc "$DEBCFG" >"$WORK/config-debian-$DEBVER"
+
+# check: every fragment line holds, nothing Debian set moved, new symbols allowed
+norm() { sed -n -e 's/^\(CONFIG_[A-Za-z0-9_]*\)=\(.*\)$/\1=\2/p' \
+	-e 's/^# \(CONFIG_[A-Za-z0-9_]*\) is not set$/\1=n/p' "$1" | sort -t= -k1,1; }
+norm "$WORK/config-debian-$DEBVER" >"$WORK/cfg-a"
+norm "$TREE/.config" >"$WORK/cfg-b"
+cat "${FRAGS[@]}" | sed -n -e 's/^\(CONFIG_[A-Za-z0-9_]*\)=.*/\1/p' \
+	-e 's/^# \(CONFIG_[A-Za-z0-9_]*\) is not set$/\1/p' | sort -u >"$WORK/cfg-frag-keys"
+bad=0
+for f in "${FRAGS[@]}"; do
+	while IFS= read -r line; do
+		case "$line" in
+		CONFIG_*=*) grep -qxF "$line" "$WORK/cfg-b" || { log "fragment line not held: $line"; bad=1; } ;;
+		"# CONFIG_"*" is not set") k=${line#\# }; k=${k%% *}
+			grep -q "^$k=" "$WORK/cfg-b" && ! grep -qxF "$k=n" "$WORK/cfg-b" &&
+				{ log "fragment line not held: $line"; bad=1; } ;;
+		esac
+	done <"$f"
+done
+DELTA="$WORK/config-delta-$KR.txt"
+join -t= -a1 -a2 -e '(absent)' -o 0,1.2,2.2 "$WORK/cfg-a" "$WORK/cfg-b" |
+	awk -F= '$2 != $3' >"$DELTA"
+while IFS== read -r k a b; do
+	grep -qxF "$k" "$WORK/cfg-frag-keys" && continue
+	if [ "$a" != '(absent)' ] && [ "$a" != n ]; then
+		log "olddefconfig changed a symbol Debian set: $k $a -> $b"; bad=1
+	elif [ "$b" = y ] || [ "$b" = m ]; then
+		echo "$k" | grep -Eq "$NEW_SYMBOL_ALLOW" ||
+			{ log "new symbol turned on outside the allow list: $k=$b"; bad=1; }
+	fi
+done <"$DELTA"
+[ "$bad" = 0 ] || die "config check failed; delta in $DELTA"
+log "config delta vs Debian $DEBVER ($(wc -l <"$DELTA") symbols): $DELTA"
+
+write_manifest() {
+	M="$OUT/BUILD-MANIFEST-$KR.txt"
+	{
+		echo "velo5x0-kernel-build manifest"
+		echo "kernel release: $KR"
+		echo "package version: $PKGVER"
+		echo "debian source: linux-source-6.12 $DEBVER sha256 $(sha256sum "$SRCDEB" | cut -d' ' -f1)"
+		echo "debian config: linux-config-6.12:amd64 $DEBVER sha256 $(sha256sum "$CFGDEB" | cut -d' ' -f1) (config.amd64_none_amd64)"
+		echo "build host arch: $HOSTARCH; make arguments: ${CROSS[*]}"
+		echo "compiler: $(x86_64-linux-gnu-gcc-14 --version | head -n1)"
+		echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+		echo "patches:"; for p in "${PATCHES[@]}"; do echo "  $p"; done
+		echo "config fragments:"; for f in "${FRAGS[@]}"; do echo "  $(basename "$f") $(sha256sum "$f" | cut -d' ' -f1)"; done
+		echo "config delta (symbol debian -> velo5x0):"; sed 's/^/  /' "$DELTA"
+		echo "packages:"
+		for d in "$OUT"/*"$KR"*.deb; do [ -e "$d" ] && echo "  $(basename "$d") $(sha256sum "$d" | cut -d' ' -f1)"; done
+	} >"$M"
+	log "manifest: $M"
+}
+
+if [ "$SOURCE_ONLY" = 1 ]; then
+	write_manifest
+	log "--source-only: stopping before the compile; tree $TREE"
+	exit 0
+fi
+
+# ------------------------------------------------------------ build
+shopt -s nullglob
+have=("$WORK"/linux-image-"$KR"_*.deb "$WORK"/linux-headers-"$KR"_*.deb)
+if [ "$RESUME" = 1 ] && [ ${#have[@]} -ge 2 ]; then
+	log "--resume: packages for $KR already built; skipping the build"
+else
+log "building $KR ($PKGVER) with $JOBS jobs; this takes a while"
+# Debian's trusted-key path is not in linux-source; the fragment empties it
+# and the build generates a throw-away module signing key.
+nice -n 19 make -C "$TREE" "${CROSS[@]}" -j"$JOBS" \
+	LOCALVERSION="$SUFFIX" KDEB_PKGVERSION="$PKGVER" KDEB_CHANGELOG_DIST=trixie \
+	KBUILD_BUILD_USER=velo5x0 KBUILD_BUILD_HOST=kbuild \
+	bindeb-pkg >"$WORK/build-$KR.log" 2>&1 ||
+	{ tail -n 60 "$WORK/build-$KR.log" >&2; die "kernel build failed; log $WORK/build-$KR.log"; }
+fi
+[ "$(make -s -C "$TREE" "${CROSS[@]}" LOCALVERSION="$SUFFIX" kernelrelease)" = "$KR" ] ||
+	die "kernelrelease is not $KR"
+
+# ------------------------------------------------------------ headers package fix-ups
+# 1. .config: bindeb-pkg's headers carry include/config/auto.conf but not
+#    .config, which Debian's headers do carry and which DKMS reads for
+#    BUILD_EXCLUSIVE_CONFIG; add it.
+# 2. cross builds: x86-64 objtool and resolve_btfids (see the header).
+HDEB=$(ls "$WORK"/linux-headers-"$KR"_*.deb | head -n1)
+[ -n "$HDEB" ] || die "no linux-headers-$KR .deb in $WORK"
+HD="usr/src/linux-headers-$KR"
+XT="$WORK/xtools-$KR"
+mkdir -p "$XT"
+RP="$XT/repack-$(date +%s)"
+[ -e "$XT/$(basename "$HDEB").orig" ] || cp "$HDEB" "$XT/$(basename "$HDEB").orig"
+dpkg-deb -R "$XT/$(basename "$HDEB").orig" "$RP"	# always from bindeb-pkg's original
+install -m 0644 "$TREE/.config" "$RP/$HD/.config"
+[ -e "$RP/DEBIAN/md5sums" ] && { grep -v "  $HD/.config\$" "$RP/DEBIAN/md5sums" >"$XT/md5sums.tmp" || true
+	(cd "$RP" && md5sum "$HD/.config") >>"$XT/md5sums.tmp"; cat "$XT/md5sums.tmp" >"$RP/DEBIAN/md5sums"; }
+if [ "$HOSTARCH" != amd64 ]; then
+	mkdir -p "$XT/objtool" "$XT/resolve_btfids"
+	XA=(HOSTCC=x86_64-linux-gnu-gcc-14 CC=x86_64-linux-gnu-gcc-14 HOSTLD=x86_64-linux-gnu-ld
+		LD=x86_64-linux-gnu-ld HOSTAR=x86_64-linux-gnu-ar AR=x86_64-linux-gnu-ar ARCH=x86_64 SRCARCH=x86)
+	log "cross build: rebuilding objtool and resolve_btfids for x86-64 for the headers package"
+	make -s -C "$TREE/tools/objtool" O="$XT/objtool" "${XA[@]}" -j"$JOBS" >"$XT/objtool.log" 2>&1 ||
+		die "x86-64 objtool build failed (can this host run amd64 binaries? binfmt); log $XT/objtool.log"
+	make -s -C "$TREE/tools/bpf/resolve_btfids" O="$XT/resolve_btfids" "${XA[@]}" -j"$JOBS" >"$XT/resolve_btfids.log" 2>&1 ||
+		die "x86-64 resolve_btfids build failed; log $XT/resolve_btfids.log"
+	{ "$XT/objtool/objtool" --help 2>&1 || true; } | grep -q Usage || die "rebuilt objtool does not run"
+	{ "$XT/resolve_btfids/resolve_btfids" --help 2>&1 || true; } | grep -q Usage || die "rebuilt resolve_btfids does not run"
+	for t in tools/objtool/objtool:objtool/objtool tools/bpf/resolve_btfids/resolve_btfids:resolve_btfids/resolve_btfids; do
+		dst=${t%%:*}; src=${t#*:}
+		if [ -e "$RP/$HD/$dst" ]; then
+			install -m 0755 "$XT/$src" "$RP/$HD/$dst"
+			sum=$(md5sum "$RP/$HD/$dst" | cut -d' ' -f1)
+			[ -e "$RP/DEBIAN/md5sums" ] && sed -i "s|^[0-9a-f]*  $HD/$dst\$|$sum  $HD/$dst|" "$RP/DEBIAN/md5sums"
+		fi
+	done
+	log "cross build: x86-64 objtool and resolve_btfids put in the headers package"
+fi
+dpkg-deb --root-owner-group -Zxz --build "$RP" "$HDEB" >/dev/null
+log "headers package repacked (original kept in $XT)"
+
+# ------------------------------------------------------------ verify + collect
+debs=("$WORK"/linux-image-"$KR"_*.deb "$WORK"/linux-headers-"$KR"_*.deb "$WORK"/linux-image-"$KR"-dbg_*.deb)
+[ ${#debs[@]} -ge 2 ] || die "expected linux-image and linux-headers debs for $KR in $WORK"
+V="$WORK/verify-$KR-$(date +%s)"
+mkdir -p "$V"
+dpkg-deb -x "$WORK"/linux-image-"$KR"_*.deb "$V/image"
+dpkg-deb -x "$WORK"/linux-headers-"$KR"_*.deb "$V/headers"
+MODDIR=$(find "$V/image" -type d -path "*/modules/$KR" | head -n1)
+[ -n "$MODDIR" ] || die "no modules/$KR directory in the image deb"
+for m in net/dsa/dsa_core drivers/net/dsa/mv88e6xxx/mv88e6xxx net/dsa/tag_dsa; do
+	ls "$MODDIR/kernel/$m".ko* >/dev/null 2>&1 || die "image deb lacks $m.ko"
+done
+# every ELF in the headers package must be an x86-64 executable (DKMS runs them on the box)
+nonx86=$(find "$V/headers" -type f -exec file {} + | grep ' ELF ' | grep -v 'x86-64' || true)
+[ -z "$nonx86" ] || die "headers deb has non-x86-64 binaries: $nonx86"
+grep -q '^CONFIG_NET_DSA=m' "$V/headers"/usr/src/linux-headers-"$KR"/.config ||
+	die "headers .config lacks CONFIG_NET_DSA=m"
+dpkg-deb -I "$HDEB" md5sums >"$V/headers.md5sums" 2>/dev/null &&
+	{ (cd "$V/headers" && md5sum -c --quiet "$V/headers.md5sums") || die "headers .deb md5sums do not match its files"; }
+for d in "${debs[@]}"; do cp "$d" "$OUT/"; done
+cp "$DELTA" "$OUT/"
+write_manifest
+log "done: $KR in $OUT (do NOT install linux-libc-dev from $WORK)"

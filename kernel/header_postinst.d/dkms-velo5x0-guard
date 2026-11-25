@@ -1,0 +1,6 @@
+#!/bin/sh
+# velo5x0-bsp: header postinst, after the dkms hook built the modules
+# The hook stays (a conffile) after the package is removed: do nothing then.
+G=/usr/lib/velo5x0-bsp/velo5x0-kernel-guard
+[ -x "$G" ] || exit 0
+exec "$G" headers "$@"

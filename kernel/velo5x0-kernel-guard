@@ -1,0 +1,236 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# velo5x0-bsp kernel guard (VBSP-REQ-5, VBSP-DES-1 x-kernel-update-failure)
+#
+# A kernel whose board modules (vc-edge5x0-board, vc-edge5x0-switch, the DKMS
+# igb, and on a velo5x0-bsp DSA kernel also vc-edge5x0-dsa with the in-tree
+# DSA modules) are not installed must never become the boot default, because
+# booting it loses GE1/GE2 and the switches.  This is done by pinning, not by
+# hoping no one runs update-grub:
+#
+#   * /etc/default/grub.d/velo5x0-bsp.cfg sets GRUB_DEFAULT=saved, so GRUB
+#     boots grubenv's saved_entry whatever the order of entries in grub.cfg;
+#   * `pin` sets saved_entry (grub-set-default) to the newest installed 6.12
+#     kernel that is VERIFIED: its modules are in updates/dkms and its
+#     vmlinuz and initrd are in /boot.  A velo5x0-bsp DSA kernel
+#     (<ver>+velo5x0dsa<N>, built by velo5x0-kernel-build) is preferred over
+#     any stock Debian -amd64 kernel, newer or not, because only it gives
+#     lan1..lan8: a Debian kernel update is not booted until the matching DSA
+#     kernel has been built and installed (README, "Kernel updates").  It
+#     runs after every update-grub of a
+#     kernel install or removal (zz-velo5x0-pin, which sorts after
+#     zz-update-grub), after a headers install, and from the package postinst.
+#     An unverified kernel can be in grub.cfg (any later update-grub adds
+#     it) but it is never the default.
+#
+# Modes (run by the hook wrappers):
+#   image <kver>    kernel postinst, after the dkms hook.  Modules present: ok.
+#                   Headers not installed yet (linux-headers-<kver> configures
+#                   after linux-image-<kver>): DEFER, exit 0, the kernel stays
+#                   unpinned and the headers hook finishes the job.  Headers
+#                   present but modules missing (a real build failure) or a
+#                   kernel outside 6.12: exit 1, which fails the kernel install
+#                   loudly; the kernel is not pinned either way.
+#   headers <kver>  header_postinst, after the dkms hook built the modules.
+#                   If the image is installed and the modules are now present:
+#                   rebuild that kernel's initramfs (it was made without them)
+#                   and pin.  Missing modules: exit 1 (loud), not pinned.
+#   pin             as above.
+#   status          print what pin would choose and the current saved_entry.
+#
+# Everything is logged to $LOG on the root file system (not /var/log, which
+# may be a tmpfs) and, for failures, to the journal at daemon.crit.
+# Test hooks: VELO5X0_MODROOT VELO5X0_BOOT VELO5X0_GRUBCFG VELO5X0_STATE
+#             VELO5X0_SETDEFAULT VELO5X0_GRUBENV_LIST VELO5X0_INITRAMFS
+set -u
+
+MODROOT=${VELO5X0_MODROOT:-/lib/modules}
+BOOT=${VELO5X0_BOOT:-/boot}
+GRUBCFG=${VELO5X0_GRUBCFG:-/boot/grub/grub.cfg}
+STATE=${VELO5X0_STATE:-/var/lib/velo5x0-bsp}
+LOG=${VELO5X0_LOG:-$STATE/kernel-guard.log}
+SETDEFAULT=${VELO5X0_SETDEFAULT:-grub-set-default}
+GRUBENV_LIST=${VELO5X0_GRUBENV_LIST:-grub-editenv - list}
+INITRAMFS=${VELO5X0_INITRAMFS:-update-initramfs}
+MODULES="vc-edge5x0-board vc-edge5x0-switch igb"
+DSA_MODULES="vc-edge5x0-dsa"
+# in-tree modules a DSA kernel must carry (relative to its kernel/ directory)
+DSA_INTREE="net/dsa/dsa_core drivers/net/dsa/mv88e6xxx/mv88e6xxx net/dsa/tag_dsa"
+
+say() {
+	mkdir -p "$(dirname "$LOG")" 2>/dev/null
+	printf '%s velo5x0-bsp: %s\n' "$(date -Is 2>/dev/null)" "$*" >>"$LOG" 2>/dev/null
+	printf 'velo5x0-bsp: %s\n' "$*" >&2
+}
+
+crit() {
+	say "$*"
+	command -v logger >/dev/null 2>&1 && logger -p daemon.crit -t velo5x0-bsp "$*"
+}
+
+in_series() { case "$1" in 6.12.*) return 0 ;; esac; return 1; }
+
+# a velo5x0-bsp DSA kernel (velo5x0-kernel-build): <ver>+velo5x0dsa<N>
+dsa_kernel() { case "$1" in *+velo5x0dsa[0-9]*) return 0 ;; esac; return 1; }
+
+# qualified: the generic Debian amd64 flavour and the velo5x0-bsp DSA kernel;
+# -rt and -cloud never get pinned
+flavour_ok() {
+	dsa_kernel "$1" && return 0
+	case "$1" in
+	*-rt-amd64 | *-cloud-amd64) return 1 ;;
+	*-amd64) return 0 ;;
+	esac
+	return 1
+}
+
+have_ko() { # <path without .ko>
+	for ext in ko ko.xz ko.zst ko.gz; do
+		[ -e "$1.$ext" ] && return 0
+	done
+	return 1
+}
+
+# what kernel $1 lacks, as words (empty: nothing)
+missing_modules() {
+	out=""
+	mods=$MODULES
+	dsa_kernel "$1" && mods="$mods $DSA_MODULES"
+	for m in $mods; do
+		have_ko "$MODROOT/$1/updates/dkms/$m" || out="$out $m"
+	done
+	if dsa_kernel "$1"; then
+		for m in $DSA_INTREE; do
+			have_ko "$MODROOT/$1/kernel/$m" || out="$out ${m##*/}(in-tree)"
+		done
+	fi
+	echo "$out"
+}
+
+modules_ok() { [ -z "$(missing_modules "$1")" ]; }
+
+headers_present() { [ -e "$MODROOT/$1/build/Makefile" ]; }
+
+verified() {
+	in_series "$1" && flavour_ok "$1" && modules_ok "$1" &&
+		[ -e "$BOOT/vmlinuz-$1" ] && [ -e "$BOOT/initrd.img-$1" ]
+}
+
+# verified kernels in pin order: DSA kernels newest first, then stock newest first
+verified_kernels() {
+	all=$(for d in "$MODROOT"/*; do
+		[ -d "$d" ] || continue
+		k=${d##*/}
+		verified "$k" && echo "$k"
+	done | sort -rV)
+	for k in $all; do dsa_kernel "$k" && echo "$k"; done
+	for k in $all; do dsa_kernel "$k" || echo "$k"; done
+}
+
+newest_verified() { verified_kernels | head -n 1; }
+
+current_saved() { $GRUBENV_LIST 2>/dev/null | sed -n 's/^saved_entry=//p'; }
+
+# does saved_entry name an entry that grub.cfg still has?
+saved_entry_exists() {
+	[ -n "$1" ] && [ -r "$GRUBCFG" ] || return 1
+	grep -qF "'${1##*>}'" "$GRUBCFG"
+}
+
+# "<submenu id>>Advanced options entry id" for kernel $1 from grub.cfg, or nothing
+grub_entry() {
+	[ -r "$GRUBCFG" ] || return 0
+	sub=$(sed -n "s/^submenu '[^']*' \$menuentry_id_option '\([^']*\)'.*/\1/p" "$GRUBCFG" | head -n 1)
+	ent=$(sed -n "s/^[[:space:]]*menuentry '[^']*' .*\$menuentry_id_option '\(gnulinux-[^']*-advanced-[^']*\)'.*/\1/p" "$GRUBCFG" |
+		grep -F "gnulinux-$1-advanced-" | head -n 1)
+	[ -n "$sub" ] && [ -n "$ent" ] && echo "$sub>$ent"
+}
+
+cmd_pin() {
+	cur=$(current_saved)
+	k="" e=""
+	for v in $(verified_kernels); do
+		e=$(grub_entry "$v")
+		if [ -n "$e" ]; then
+			k=$v
+			break
+		fi
+		say "verified kernel $v has no entry in $GRUBCFG yet; trying the next older one"
+	done
+	if [ -z "$k" ]; then
+		if saved_entry_exists "$cur"; then
+			state="it still names an existing entry"
+		else
+			state="it names no existing entry (${cur:-unset}), so GRUB falls back to its first entry"
+		fi
+		crit "no verified 6.12 kernel (-amd64 or +velo5x0dsa) with a GRUB entry (modules + vmlinuz + initrd); saved_entry left untouched: $state"
+		return 0
+	fi
+	if [ "$cur" = "$e" ]; then
+		say "GRUB default already pinned to $k"
+		return 0
+	fi
+	if $SETDEFAULT "$e"; then
+		mkdir -p "$STATE" 2>/dev/null && echo "$k" >"$STATE/pinned-kernel"
+		say "GRUB default pinned to $k ($e), was ${cur:-unset}"
+	else
+		crit "grub-set-default for $k failed; GRUB default unchanged (${cur:-unset})"
+	fi
+	return 0
+}
+
+cmd_image() {
+	k=$1
+	if ! in_series "$k"; then
+		crit "kernel $k is outside the 6.12 series this board support is qualified for; not made the boot default; kernel install failed on purpose"
+		exit 1
+	fi
+	if ! flavour_ok "$k"; then
+		say "kernel $k is neither the generic -amd64 flavour nor a velo5x0-bsp DSA kernel; it is never made the boot default (no check)"
+		exit 0
+	fi
+	if modules_ok "$k"; then
+		say "kernel $k: board modules present"
+		exit 0
+	fi
+	if ! headers_present "$k"; then
+		say "kernel $k: headers not installed yet; deferred to the linux-headers-$k hook (the kernel is not made the boot default until its modules are verified)"
+		exit 0
+	fi
+	crit "kernel $k: board modules NOT installed (missing:$(missing_modules "$k")) although headers are present; DKMS build failed (see /var/lib/dkms/*/*/build/make.log). The kernel will not be made the boot default. Fix, then: dpkg --configure -a"
+	exit 1
+}
+
+cmd_headers() {
+	k=$1
+	in_series "$k" && flavour_ok "$k" || { say "headers $k: not a qualified 6.12 kernel, ignored"; exit 0; }
+	if [ ! -e "$BOOT/vmlinuz-$k" ]; then
+		say "headers $k: kernel image not installed yet; its own hook will verify"
+		exit 0
+	fi
+	if ! modules_ok "$k"; then
+		crit "headers $k: board modules NOT installed after the DKMS build (missing:$(missing_modules "$k")); kernel $k will not be made the boot default"
+		exit 1
+	fi
+	say "headers $k: board modules present; rebuilding the initramfs of $k so it carries them"
+	if ! $INITRAMFS -u -k "$k"; then
+		crit "headers $k: update-initramfs failed; kernel $k not pinned"
+		exit 1
+	fi
+	cmd_pin
+	exit 0
+}
+
+case "${1:-}" in
+image) cmd_image "${2:?kernel version}" ;;
+headers) cmd_headers "${2:?kernel version}" ;;
+pin) cmd_pin ;;
+status)
+	echo "verified kernels (newest first): $(verified_kernels | tr '\n' ' ')"
+	k=$(newest_verified)
+	echo "newest verified: ${k:-none}; its GRUB entry: $( [ -n "$k" ] && grub_entry "$k")"
+	cur=$(current_saved)
+	echo "saved_entry: ${cur:-unset} ($(saved_entry_exists "$cur" && echo exists in grub.cfg || echo NOT in grub.cfg))"
+	;;
+*) echo "usage: velo5x0-kernel-guard image|headers <kver> | pin | status" >&2; exit 2 ;;
+esac

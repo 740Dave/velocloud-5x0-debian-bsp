@@ -1,0 +1,23 @@
+# velo5x0-bsp (VBSP-DES-5 x-failsafe-b and x-failsafe-c): full fan duty from
+# early boot until velo5x0-fand takes over, and again when this unit is
+# stopped at shutdown or reboot.  540 only (the 520 has no fan).
+[Unit]
+Description=VeloCloud Edge 540 fan fail-safe (full duty at boot and at shutdown)
+Documentation=file:/usr/share/doc/velo5x0-bsp/README.md
+ConditionFirmware=smbios-field(board_name = EDGE540)
+DefaultDependencies=no
+Wants=systemd-modules-load.service
+After=systemd-modules-load.service local-fs.target
+Before=sysinit.target shutdown.target velo5x0-fand.service
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-/usr/sbin/modprobe -q i2c-dev
+ExecStartPre=-/usr/sbin/modprobe -q vc-edge5x0-board
+ExecStart=/usr/sbin/velo5x0-fan full --why early-boot
+ExecStop=/usr/sbin/velo5x0-fan full --why shutdown-unit-stop
+
+[Install]
+WantedBy=sysinit.target

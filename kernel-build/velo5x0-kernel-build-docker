@@ -1,0 +1,32 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# velo5x0-kernel-build-docker: run velo5x0-kernel-build in a throw-away
+# Debian 13 container on any Docker host (amd64 or arm64; arm64 cross-builds).
+#
+# Usage: velo5x0-kernel-build-docker <debian-version> [rev] [outdir] [-- extra args]
+#   e.g. velo5x0-kernel-build-docker 6.12.119-1 1 ~/velo5x0-kbuild/out
+#   Extra arguments after -- go to velo5x0-kernel-build (e.g. --source-only,
+#   --snapshot 20261201T000000Z, --jobs 8).
+#
+# The source tree, the build tree and the downloads live in the Docker volume
+# velo5x0-kbuild (about 30 GB per build, kept for inspection; remove trees you
+# no longer need by hand, e.g. `docker run --rm -v velo5x0-kbuild:/build
+# debian:trixie rm -r /build/work/linux-<KR>`).  The .debs and the build
+# manifest are copied to <outdir> (default ./velo5x0-kbuild-out).
+set -eu
+DEBVER=${1:?usage: velo5x0-kernel-build-docker <debian-version> [rev] [outdir] [-- extra args]}
+REV=${2:-1}
+OUT=${3:-$PWD/velo5x0-kbuild-out}
+shift; [ $# -gt 0 ] && shift; [ $# -gt 0 ] && shift
+[ "${1:-}" = -- ] && shift
+HERE=$(cd "$(dirname "$0")" && pwd)
+DOCKER=${DOCKER:-docker}
+mkdir -p "$OUT"
+OUT=$(cd "$OUT" && pwd)
+exec "$DOCKER" run --rm \
+	-v velo5x0-kbuild:/build \
+	-v "$HERE":/kernel-build:ro \
+	-v "$OUT":/out \
+	debian:trixie \
+	/kernel-build/velo5x0-kernel-build --debian-version "$DEBVER" --rev "$REV" \
+	--install-deps --workdir /build/work --outdir /out "$@"
