@@ -2,8 +2,12 @@
 
 ## 0.5.1 (2026-11-25)
 
-Not yet run on hardware. Tested off the box only (fake sensors and a fake fan
-chip); the 30-minute check on a 540 is still to be done.
+Tested on hardware: one Edge 540 (Debian 13, kernel 6.12.118+velo5x0dsa1),
+2026-11-25, 03:18-04:06 PST. Two drive-demand starts at 60 C, each held for
+exactly 600 s at duty 69/255 (about 3900-4000 rpm) while the mSATA fell from
+60 C to 43-44 C; it then took about 20 minutes to re-warm. No stall latch, no
+fault. CPU demand was not exercised (CPU 23-40 C). Restarting the daemon drops
+a hold in progress (documented below).
 
 - Fan: a minimum run time. Each time drive demand turns on (also if the CPU
   already runs the fan), the fan holds at least `drive_min_duty` (69/255) for `drive_min_run_s` seconds (new key in

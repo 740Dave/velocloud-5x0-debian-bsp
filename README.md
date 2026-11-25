@@ -26,13 +26,12 @@ is developed in public here.
 ## Status
 
 Running on one VeloCloud Edge 540 since 2026-11-24 on Debian 13 with kernel
-`6.12.118+velo5x0dsa1` (velo5x0-bsp 0.4.x, and 0.5.0 since 2026-11-24). We'll update this section if we hit problems.
+`6.12.118+velo5x0dsa1` (velo5x0-bsp 0.4.x, 0.5.0 since 2026-11-24, 0.5.1 since 2026-11-25). We'll update this section if we hit problems.
 
 Burn-in time is short so far; treat this as early. Reports from other units are welcome.
 
-Version 0.5.0 (drive-temperature fan input) runs on that unit since 2026-11-24; see the
-0.5.0 CHANGELOG entry for what was observed. Version 0.5.1 (minimum run time) has not yet
-run on hardware.
+Versions 0.5.x run on that unit: 0.5.0 (drive-temperature fan input) since 2026-11-24 and
+0.5.1 (minimum run time) since 2026-11-25; see the CHANGELOG entries for what was observed.
 
 ## Supported hardware
 
@@ -112,8 +111,6 @@ between DSA and unmanaged modes, and upgrade notes are in `docs/TECHNICAL.md`.
 From 0.5.1, each time drive demand turns on (also if the CPU already runs the
 fan) the fan holds at least its minimum drive duty for 10 minutes
 (`drive_min_run_s` in `/etc/velo5x0-bsp/fan.conf`, 0 to 3600, 0 turns this off).
-Not yet run on hardware.
-
 From 0.5.0 the fan service reads drive temperatures through the kernel
 `drivetemp` driver every 10 s. On some spinning disks, reading the temperature
 can keep the drive from spinning down (see the kernel's `drivetemp`
