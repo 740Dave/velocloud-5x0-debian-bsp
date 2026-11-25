@@ -108,6 +108,9 @@ between DSA and unmanaged modes, and upgrade notes are in `docs/TECHNICAL.md`.
 
 ## Drive temperature and disk spin-down
 
+From 0.5.1 each time a drive starts the fan it runs at least 10 minutes
+(`drive_min_run_s` in `/etc/velo5x0-bsp/fan.conf`, 0 turns this off).
+
 From 0.5.0 the fan service reads drive temperatures through the kernel
 `drivetemp` driver every 10 s. On some spinning disks, reading the temperature
 can keep the drive from spinning down (see the kernel's `drivetemp`

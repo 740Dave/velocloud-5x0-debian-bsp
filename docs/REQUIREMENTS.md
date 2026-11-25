@@ -6,7 +6,7 @@ states, in plain English, what each referenced item requires or records. The
 words MUST and MUST NOT carry their usual meaning: a build or change that
 breaks one is a bug.
 
-Items marked (0.5.0) are not in 0.4.1.
+Items marked (0.5.0) are not in 0.4.1; items marked (0.5.1) are not in 0.5.0.
 
 Scope: a VeloCloud Edge 540, board version 2.x, running Debian 13 ("trixie")
 with a 6.12-series kernel. The Edge 520 is within the intent but has not been
@@ -117,6 +117,17 @@ Hysteresis: once drive-demand-on is set, drive demand MUST NOT fall below 69
 until T is at or below 55 C (or no drive reports a temperature). Drive demand is
 evaluated on every poll of the CPU loop. The thresholds and the 69 minimum are
 configurable in `/etc/velo5x0-bsp/fan.conf`.
+
+**REQ-14 amendment (0.5.1): minimum run time.** Whenever the fan starts because
+of drive demand, it MUST run at no less than the drive minimum duty (69 of 255)
+for at least 10 minutes (`drive_min_run_s`, default 600) before drive demand may
+turn it off, even if the hottest drive falls to 55 C or below sooner. In plain
+terms: once a hot drive starts the fan, it keeps running for at least 10
+minutes. CPU demand, the CPU fail-safes and the stall latch are unaffected, and a
+CPU fail-safe always wins. A value of 0 disables the minimum; a negative value
+is refused. The timer need not survive a restart of the service. Test: a drive
+at 61 C then 54 C after 30 s gives duty 69 until 600 s and then 0
+(`tests/test_fan_drive.py`, `TestMinimumRun`).
 
 - **REQ-14A (0.5.0).** A drive that reports no temperature (for example onboard flash)
   MUST be ignored. A 540 with no drive that reports a temperature MUST behave

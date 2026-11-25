@@ -61,6 +61,7 @@ class FakeSys:
 def make_drive(sysfs=None, temps=None, cfg=None, drive_fn="sys", state_file=None, alert_file=None):
     raw = tf.FakeI2C()
     log = tf.Logs()
+    cfg_in = cfg
     seq = list(temps or [40.0])
     st = {"i": 0}
 
@@ -69,7 +70,10 @@ def make_drive(sysfs=None, temps=None, cfg=None, drive_fn="sys", state_file=None
         st["i"] += 1
         return v
     fn = fan.DriveSource(sysfs=sysfs.root).poll if drive_fn == "sys" else drive_fn
-    c = fan.Controller(fan.GuardedBus(raw, log), temp_fn, dict(cfg or fan.DEFAULTS), log, sleep=raw.clock.sleep,
+    cfg = dict(cfg or fan.DEFAULTS)
+    if "drive_min_run_s" not in (cfg_in or {}):
+        cfg["drive_min_run_s"] = 0      # the pre-0.5.1 tests measure the bands, not the minimum run
+    c = fan.Controller(fan.GuardedBus(raw, log), temp_fn, cfg, log, sleep=raw.clock.sleep,
                        clock=raw.clock, alert_file=alert_file, state_file=state_file, drive_fn=fn)
     c.identify()
     c.configure()
@@ -491,6 +495,161 @@ class TestDriveFailureAndChange(unittest.TestCase):
             self.assertEqual(c.duty, 255)
 
 
+class TestMinimumRun(unittest.TestCase):
+    """VBSP-REQ-14 amendment (0.5.1): a drive-demand start holds drive_min_duty for drive_min_run_s."""
+    def setup(self, td, run_s=None, temp=61.0, cpu_t=40.0, alert=None):
+        s = FakeSys(td)
+        s.add("hwmon1", "drivetemp", temp, block="sda")
+        cfg = dict(fan.DEFAULTS)
+        if run_s is not None:
+            cfg["drive_min_run_s"] = run_s
+        c, raw, log, st, seq = make_drive(s, temps=[cpu_t], cfg=cfg, alert_file=alert)
+        return s, c, raw, log, st, seq
+
+    def run_for(self, c, raw, s_total, st=None, step=2):
+        out = []
+        for _ in range(int(s_total / step)):
+            c.step()
+            out.append((raw.clock(), c.duty))
+            raw.clock.sleep(step)
+        return out
+
+    def test_default_is_600(self):
+        self.assertEqual(fan.DEFAULTS["drive_min_run_s"], 600)
+
+    def test_hold_until_600_then_off(self):
+        with tempfile.TemporaryDirectory() as td:
+            s, c, raw, log, st, seq = self.setup(td)
+            t0 = raw.clock()
+            c.step()
+            self.assertEqual(c.duty, 69)
+            raw.clock.sleep(30)
+            s.set("hwmon1", 54.0)
+            while raw.clock() - t0 < 598:
+                cpu(c, st, seq, 40.0)
+                c.step()
+                self.assertEqual(c.duty, 69, raw.clock() - t0)
+                raw.clock.sleep(2)
+            while raw.clock() - t0 < 604:
+                cpu(c, st, seq, 40.0)
+                c.step()
+                if raw.clock() - t0 >= 600:
+                    self.assertEqual(c.duty, 0, raw.clock() - t0)
+                raw.clock.sleep(2)
+            self.assertEqual(c.duty, 0)
+            self.assertFalse(c.drive_on)
+
+    def test_zero_disables(self):
+        with tempfile.TemporaryDirectory() as td:
+            s, c, raw, log, st, seq = self.setup(td, run_s=0)
+            c.step()
+            self.assertEqual(c.duty, 69)
+            raw.clock.sleep(30)
+            s.set("hwmon1", 54.0)
+            cpu(c, st, seq, 40.0)
+            c.step()
+            self.assertEqual(c.duty, 0)
+
+    def test_custom_value_and_each_start_gets_its_own_hold(self):
+        with tempfile.TemporaryDirectory() as td:
+            s, c, raw, log, st, seq = self.setup(td, run_s=60)
+            c.step()
+            s.set("hwmon1", 54.0)
+            raw.clock.sleep(30)
+            c.step()
+            self.assertEqual(c.duty, 69)
+            raw.clock.sleep(40)
+            c.step()
+            self.assertEqual(c.duty, 0)
+            raw.clock.sleep(1000)
+            s.set("hwmon1", 61.0)       # a second start: a new 60 s hold
+            c.step()
+            s.set("hwmon1", 54.0)
+            raw.clock.sleep(30)
+            c.step()
+            self.assertEqual(c.duty, 69)
+            raw.clock.sleep(40)
+            c.step()
+            self.assertEqual(c.duty, 0)
+
+    def test_hold_does_not_lower_higher_demand_and_ramps_normally(self):
+        with tempfile.TemporaryDirectory() as td:
+            s, c, raw, log, st, seq = self.setup(td, temp=72.0)
+            c.step()
+            self.assertEqual(c.duty, 255)
+            s.set("hwmon1", 67.5)
+            raw.clock.sleep(10)
+            c.step()
+            self.assertEqual(c.duty, 162)
+
+    def test_cpu_demand_during_hold_wins_and_outlasts(self):
+        with tempfile.TemporaryDirectory() as td:
+            s, c, raw, log, st, seq = self.setup(td)
+            c.step()
+            s.set("hwmon1", 54.0)
+            cpu(c, st, seq, 85.0)
+            raw.clock.sleep(10)
+            c.step()
+            self.assertEqual(c.duty, 255)
+
+    def test_cpu_failsafe_during_hold_gives_0xff(self):
+        with tempfile.TemporaryDirectory() as td:
+            alert = os.path.join(td, "ALERT")
+            s, c, raw, log, st, seq = self.setup(td, alert=alert)
+            c.step()
+            self.assertEqual(c.duty, 69)
+            s.set("hwmon1", 54.0)
+            raw.clock.sleep(10)
+            c.temp_fn = lambda: None            # CPU sensor read error
+            c.step()
+            self.assertEqual(c.duty, 255)
+            self.assertEqual(raw.duty_writes()[-1], 255)
+
+    def test_stall_latch_unaffected(self):
+        with tempfile.TemporaryDirectory() as td:
+            alert = os.path.join(td, "ALERT")
+            s, c, raw, log, st, seq = self.setup(td, alert=alert)
+            c.step()
+            raw.set_tach_stopped(True)
+            for _ in range(40):
+                c.step()
+                raw.clock.sleep(2)
+            self.assertTrue(c.stall_latched)
+            self.assertEqual(c.duty, 255)
+            s.set("hwmon1", 40)
+            raw.clock.sleep(700)
+            c.step()
+            self.assertEqual(c.duty, 255)
+
+    def test_vanished_drive_clears_hold(self):
+        with tempfile.TemporaryDirectory() as td:
+            s, c, raw, log, st, seq = self.setup(td)
+            c.step()
+            self.assertEqual(c.duty, 69)
+            s.remove("hwmon1")
+            raw.clock.sleep(10)
+            c.step()
+            self.assertEqual(c.duty, 0)
+            self.assertFalse(log.has("crit", ""))
+
+    def test_validation(self):
+        for bad in (-1, -600):
+            cfg = dict(fan.DEFAULTS)
+            cfg["drive_min_run_s"] = bad
+            with self.assertRaises(ValueError):
+                fan.Controller(fan.GuardedBus(tf.FakeI2C(), tf.Logs()), lambda: 40.0, cfg, tf.Logs())
+        cfg = dict(fan.DEFAULTS)
+        cfg["drive_min_run_s"] = 0
+        fan.Controller(fan.GuardedBus(tf.FakeI2C(), tf.Logs()), lambda: 40.0, cfg, tf.Logs())
+
+    def test_load_config_reads_key(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "fan.conf")
+            tf.put(p, "[fan]\ndrive_min_run_s = 120\n")
+            self.assertEqual(fan.load_config(p)["drive_min_run_s"], 120)
+            self.assertEqual(fan.load_config(os.path.join(td, "none"))["drive_min_run_s"], 600)
+
+
 class TestStallInterplay(unittest.TestCase):
     def test_healthy_fan_at_minimum_drive_duty_never_latches_for_30_min(self):
         with tempfile.TemporaryDirectory() as td:
@@ -825,8 +984,8 @@ class TestPackageBuild(unittest.TestCase):
         t = read(os.path.join(SRC, "fan/velo5x0-fan"))
         self.assertIn("DriveReader(DriveSource(), log=log)", t)
         self.assertIn("drive_fn=reader.poll", t)
-        self.assertEqual(read(os.path.join(SRC, "VERSION")).strip(), "0.5.0")
-        self.assertIn("## 0.5.0", read(os.path.join(SRC, "CHANGELOG.md")))
+        self.assertEqual(read(os.path.join(SRC, "VERSION")).strip(), "0.5.1")
+        self.assertIn("## 0.5.1", read(os.path.join(SRC, "CHANGELOG.md")))
 
     def test_shell_script_syntax(self):
         r = subprocess.run(["sh", "-n", os.path.join(SRC, "packaging/build-debs.sh")], capture_output=True, text=True)

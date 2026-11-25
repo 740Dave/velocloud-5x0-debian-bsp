@@ -253,6 +253,14 @@ coretemp reading (the Atom C2000 has per-core sensors, no package sensor).
   logs "no drive temperature input" once. A drive read failure or a vanished
   drive is logged and dropped, and never forces full duty. The state file
   carries `drive_temp_c`, `drive_name`, `drive_demand_active` and `drives`.
+  Minimum run time (v0.5.1): when drive demand turns on, the controller stores
+  `clock() + drive_min_run_s` (monotonic clock). While that time is in the
+  future and the drive still reports, a fall to `drive_off_c` does not release
+  drive demand: the duty stays `drive_min_duty` and drive-demand-on stays set.
+  Later, drive demand releases as before. The hold only keeps drive demand
+  up; it does not touch the CPU path, the fail-safes or the stall latch, and it
+  is not kept over a restart. `drive_min_run_s` is validated at start
+  (>= 0; 0 disables) and a negative value stops the service with a logged error.
   On a 520 the fan service is not enabled for now (the 520 has a fan, but its
   controller has not been identified or verified on hardware; contributions
   welcome), so this does nothing.

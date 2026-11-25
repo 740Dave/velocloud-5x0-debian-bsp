@@ -114,8 +114,9 @@ DEFAULTS = {
     "drive_ramp_c": 65.0,   # from here the duty rises linearly ...
     "drive_full_c": 70.0,   # ... to full duty at this temperature and above
     "drive_min_duty": 69,   # 69/255 = 27 %; must exceed stall_free_duty (VBSP-REQ-14B)
+    "drive_min_run_s": 600, # each drive-demand start holds at least drive_min_duty this long; 0 = off (0.5.1)
 }
-DRIVE_INT_KEYS = ("drive_min_duty",)
+DRIVE_INT_KEYS = ("drive_min_duty", "drive_min_run_s")
 SMARTCTL_INTERVAL_S = 60.0      # smartctl fallback: at most one pass a minute
 SMARTCTL_CMD_TIMEOUT_S = 3.0    # per command
 SMARTCTL_PASS_BUDGET_S = 8.0    # per pass, all commands together (watchdog is 30 s)
@@ -593,6 +594,7 @@ class Controller:
         self.drive_fn = drive_fn            # () -> (source, {name: C|None}); None = no drive input
         self.drive_on = False               # drive-demand-on (hysteresis bit)
         self.drive_duty = 0
+        self.drive_hold_until = None        # clock time before which drive demand may not release (min run)
         self.drive_temp = None              # hottest drive used as the input
         self.drive_name = None
         self.drive_source = None
@@ -621,6 +623,8 @@ class Controller:
             raise ValueError("stall_free_duty must be 1..255")
         if not (c["drive_off_c"] < c["drive_on_c"] <= c["drive_ramp_c"] < c["drive_full_c"]):
             raise ValueError("need drive_off_c < drive_on_c <= drive_ramp_c < drive_full_c")
+        if int(c["drive_min_run_s"]) < 0:
+            raise ValueError("drive_min_run_s must be >= 0 (0 disables the minimum run time)")
         if int(c["drive_min_duty"]) <= int(c["stall_free_duty"]) or int(c["drive_min_duty"]) > DUTY_FULL:
             # a v0.4 config with a raised stall_free_duty stays valid: the drive
             # minimum moves up to just above it (VBSP-REQ-14: above stall-free)
@@ -784,6 +788,20 @@ class Controller:
             self.drive_name = self.drive_temp = self.drive_source = None
         was_on = self.drive_on
         self.drive_duty, self.drive_on = drive_demand(self.drive_temp, self.drive_on, self.cfg)
+        # minimum run time (VBSP-REQ-14 amendment, 0.5.1): each start of drive
+        # demand holds at least drive_min_duty for drive_min_run_s before drive
+        # demand may release.  The hold never raises the duty above what drive
+        # demand asks, never applies when no drive reports (a vanished drive
+        # clears it, 14A), and cannot block a CPU fail-safe or the stall latch,
+        # which do not read this value.  The timer is not kept over a restart.
+        run_s = int(self.cfg["drive_min_run_s"])
+        if self.drive_on and not was_on and run_s > 0:
+            self.drive_hold_until = self.clock() + run_s
+        if self.drive_temp is None or run_s <= 0:
+            self.drive_hold_until = None
+        elif (not self.drive_on and was_on and self.drive_hold_until is not None
+              and self.clock() < self.drive_hold_until):
+            self.drive_duty, self.drive_on = int(self.cfg["drive_min_duty"]), True
         if self.drive_on != was_on:
             self.log("info", "drive demand %s (hottest %s)" % (
                 "on at %.1f C: duty %d" % (self.drive_temp, self.drive_duty) if self.drive_on
@@ -953,9 +971,10 @@ def cmd_run(args, log):
         signal.signal(signal.SIGTERM, on_term)
         signal.signal(signal.SIGINT, on_term)
         log("info", "start: off %.0f C, on %.0f C, full %.0f C, stall-free duty %d; drives off %.0f, on %.0f, "
-            "ramp %.0f, full %.0f C, min duty %d"
+            "ramp %.0f, full %.0f C, min duty %d, min run %d s"
             % (cfg["off_c"], cfg["on_c"], cfg["full_c"], cfg["stall_free_duty"], cfg["drive_off_c"],
-               cfg["drive_on_c"], cfg["drive_ramp_c"], cfg["drive_full_c"], cfg["drive_min_duty"]))
+               cfg["drive_on_c"], cfg["drive_ramp_c"], cfg["drive_full_c"], cfg["drive_min_duty"],
+               cfg["drive_min_run_s"]))
         c.configure()
         reader.start()
         sd_notify("READY=1")
