@@ -144,8 +144,9 @@ configurable in `/etc/velo5x0-bsp/fan.conf`.
   this package.
 - **REQ-14D (0.5.0).** The drive input MUST ship in the package, enabled by default,
   with no per-machine configuration: no file edit, no unit enabled by hand, no
-  list of drives. On a 520 (no fan) the fan service is not enabled, so it has
-  nothing to act on.
+  list of drives. On a 520 the fan service is not enabled for now (the 520 has a fan, but
+  its controller has not been identified or verified on hardware; contributions
+  welcome), so it has nothing to act on.
 - **REQ-14E (0.5.0).** Drives MUST be discovered at run time, not from a list fixed at
   install or start: a drive added later is picked up with no reinstall,
   configuration change or manual restart. (The kernel `drivetemp` source is
@@ -207,7 +208,8 @@ drive demand can stay on, so the fan may run continuously at about 27 % instead
 of being off at idle.
 
 **HW-FAN.** The 540 fan is an EMC2104 at I2C 0x2f (product ID register 0xfd reads
-0x1d); the 520 has no fan. Recipe as in DES-5; duty is register 0x40 and 0xff is
+0x1d); the 520 has a fan, but its controller
+has not been identified or verified on hardware, so fan control is enabled on the 540 only for now (contributions welcome). Recipe as in DES-5; duty is register 0x40 and 0xff is
 full. PCA9557 at 0x1c pin 6 low and pin 7 high is the only combination where the
 fan follows PWM. The stock fan stalls below about 2700 RPM. Mainline `emc2103`
 binds only product IDs 0x24 and 0x26, so control is in userspace. The chip has a

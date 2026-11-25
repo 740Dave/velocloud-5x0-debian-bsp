@@ -1,6 +1,7 @@
 # velo5x0-bsp (VBSP-DES-5 x-failsafe-b and x-failsafe-c): full fan duty from
 # early boot until velo5x0-fand takes over, and again when this unit is
-# stopped at shutdown or reboot.  540 only (the 520 has no fan).
+# stopped at shutdown or reboot.  540 only for now (the 520 has a fan, but its
+# controller is not yet identified or verified on hardware; contributions welcome).
 [Unit]
 Description=VeloCloud Edge 540 fan fail-safe (full duty at boot and at shutdown)
 Documentation=file:/usr/share/doc/velo5x0-bsp/README.md

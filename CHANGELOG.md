@@ -1,9 +1,13 @@
 # velo5x0-bsp changelog
 
-## 0.5.0 (2026-11-24) - not yet run on hardware
+## 0.5.0 (2026-11-24)
 
-Off-box tests and a review only; the drive input has not yet run on a unit as
-packaged. The tagged 0.4.1 is what runs on hardware today.
+Tested on hardware: one Edge 540 (Debian 13, kernel 6.12.118+velo5x0dsa1),
+2026-11-24, 30-minute run. The mSATA drive temperature was read via drivetemp;
+the fan switched on at 60 C at duty 69/255 (about 3900 rpm) and off at 55 C; the
+drive peaked at 60.0 C; no stall latch; the CPU fail-safes were unaffected.
+Observed: the fan runs in short bursts (about 30 s on, several minutes off)
+because the drive warms slowly; a minimum on-time may come in a later release.
 
 Spec v0.5 (VBSP-REQ-14, 14A to 14E, VBSP-DES-9).
 

@@ -253,7 +253,9 @@ coretemp reading (the Atom C2000 has per-core sensors, no package sensor).
   logs "no drive temperature input" once. A drive read failure or a vanished
   drive is logged and dropped, and never forces full duty. The state file
   carries `drive_temp_c`, `drive_name`, `drive_demand_active` and `drives`.
-  On a 520 (no fan) the fan service is not enabled, so this does nothing.
+  On a 520 the fan service is not enabled for now (the 520 has a fan, but its
+  controller has not been identified or verified on hardware; contributions
+  welcome), so this does nothing.
 - `sudo velo5x0-fan probe` is a read-only dump; the service's state is the
   file `/run/velo5x0-fan/state.json`.
 - Upgrading from 0.4 with an edited `/etc/velo5x0-bsp/fan.conf`: the shipped

@@ -26,20 +26,19 @@ is developed in public here.
 ## Status
 
 Running on one VeloCloud Edge 540 since 2026-11-24 on Debian 13 with kernel
-`6.12.118+velo5x0dsa1` (velo5x0-bsp 0.4.x). We'll update this section if we hit problems.
+`6.12.118+velo5x0dsa1` (velo5x0-bsp 0.4.x, and 0.5.x since 2026-11-24). We'll update this section if we hit problems.
 
 Burn-in time is short so far; treat this as early. Reports from other units are welcome.
 
-**Version 0.5.0 is not yet run on hardware.** Its drive-temperature fan input has passed the
-off-box tests and a review, but the unit above runs 0.4.x. This section will say so until 0.5.0 has been
-deployed and has run for a while.
+Version 0.5.x (drive-temperature fan input) runs on that unit since 2026-11-24; see the
+0.5.0 CHANGELOG entry for what was observed.
 
 ## Supported hardware
 
 | Unit | Status |
 |---|---|
 | VeloCloud Edge 540, board version 2.x | Developed and run on one unit |
-| VeloCloud Edge 520, board version 2.x | Within the intent (same software buildout), **not checked on a 520**; no fan |
+| VeloCloud Edge 520, board version 2.x | Within the intent (same software buildout), **not checked on a 520**. The 520 has a fan, but fan control here is enabled on the 540 only for now; the 520 fan controller is not yet identified or verified on hardware (contributions welcome) |
 | Board version 1.x ("rev A") | Refused: the software touches no hardware and logs why |
 
 The software checks the DMI model and version and the igb NVM signature, and does
